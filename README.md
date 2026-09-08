@@ -81,8 +81,9 @@ newline-delimited JSON (`ping`, `execute`, `read`, `list`, `interrupt`,
   fields are omitted where the platform cannot measure them.
 - No magics, no inline plots (`Agg` + save-to-file), no `input()`/`pdb`.
 - `interrupt` injects a private `_TaskKill` exception (escapes
-  `except KeyboardInterrupt`, unlike SIGINT); stuck native calls
-  (e.g. `time.sleep`) need a respawn.
+  `except KeyboardInterrupt`, unlike SIGINT); Python-level loops die at once,
+  native calls (e.g. `time.sleep`) take effect when they return, and calls
+  that never return need a respawn.
 
 ## Development
 

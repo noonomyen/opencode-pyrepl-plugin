@@ -606,7 +606,7 @@ function formatOrphanHint(res: TaskResponse, verb: string): string[] {
 
 function formatExecResult(res: TaskResponse, session: Session, freshNote: string | null): string {
   const out: string[] = []
-  if (freshNote) out.push(`[pyrepl: ${freshNote}]`)
+  if (freshNote) out.push(`<pyrepl>\n${freshNote}\n<pyrepl>`)
   if (res.status === "running") {
     out.push(`status: running (task ${res.task_id})`)
     out.push(res.message ?? "use pyrepl_read to poll output or pyrepl_interrupt to stop it")
@@ -650,11 +650,11 @@ function extractSessionId(props: Record<string, any>): string | undefined {
 // pulls the output itself with pyrepl_read.
 function formatCompletionNotice(taskId: string, res: TaskResponse): string {
   const out = [
-    `[pyrepl: background task done: task_id=${taskId}, status=${res.status}, elapsed=${res.elapsed_ms ?? "?"}ms, output=${res.output_lines ?? "?"} lines / ${res.output_bytes ?? "?"} bytes]`,
+    `background task done: task_id=${taskId}, status=${res.status}, elapsed=${res.elapsed_ms ?? "?"}ms, output=${res.output_lines ?? "?"} lines / ${res.output_bytes ?? "?"} bytes`,
   ]
   if (res.error) out.push(`${res.error.type}: ${res.error.message}`)
   out.push(`Use pyrepl_read task_id=${taskId} for the full output.`)
-  return out.join("\n")
+  return `<pyrepl>\n${out.join("\n")}\n<pyrepl>`
 }
 
 // Push a prebuilt text into the agent's session. promptAsync admits the
@@ -691,11 +691,11 @@ async function pushText(
 }
 
 function formatDeathNotice(taskId: string): string {
-  return `[pyrepl: task ${taskId} lost: REPL server died, state lost. Re-run pyrepl_exec to respawn fresh.]`
+  return `<pyrepl>\ntask ${taskId} lost: REPL server died, state lost. Re-run pyrepl_exec to respawn fresh.\n<pyrepl>`
 }
 
 function formatLostNotice(taskId: string): string {
-  return `[pyrepl: task ${taskId} lost: no longer on server (registry evicted or cleared). Output unavailable.]`
+  return `<pyrepl>\ntask ${taskId} lost: no longer on server (registry evicted or cleared). Output unavailable.\n<pyrepl>`
 }
 
 // Notify that a background task finished. The parked queue stores only the
@@ -740,9 +740,9 @@ async function deliverCompletion(
 
 function formatProgressNotice(taskId: string, t: TaskListEntry): string {
   return (
-    `[pyrepl: task ${taskId} still running: wall=${fmtMs(t.elapsed_ms)} ` +
+    `<pyrepl>\ntask ${taskId} still running: wall=${fmtMs(t.elapsed_ms)} ` +
     `out=${t.output_lines ?? 0}lines/${fmtSize(t.output_bytes ?? 0)}. ` +
-    `pyrepl_read task_id=${taskId} tail_lines=20 for latest.]`
+    `pyrepl_read task_id=${taskId} tail_lines=20 for latest.\n<pyrepl>`
   )
 }
 
@@ -973,7 +973,7 @@ export const PyReplPlugin: Plugin = async (ctx) => {
             if (canNotify) void notifyWhenDone(client, key, res.task_id, context.agent || undefined, progressS)
             const out = formatExecResult(res, session, freshNote)
             return canNotify
-              ? `${out}\n[pyrepl: I will notify you in this session when task ${res.task_id} finishes; polling with pyrepl_read is optional]`
+              ? `${out}\n<pyrepl>\nI will notify you in this session when task ${res.task_id} finishes; polling with pyrepl_read is optional\n<pyrepl>`
               : out
           }
           if (res?.task_id) session.consumed.add(res.task_id)
@@ -1124,6 +1124,9 @@ export const PyReplPlugin: Plugin = async (ctx) => {
           if (res?.task_id) session.consumed.add(res.task_id)
           const out: string[] = [`task ${res.task_id}: ${res.status}`]
           if (res.message) out.push(res.message)
+          if (res.status === "running") {
+            out.push("[interrupt pending: takes effect when the native call returns; re-init to kill immediately]")
+          }
           out.push(
             ...formatOutputPreview(
               res,
