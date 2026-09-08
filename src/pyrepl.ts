@@ -17,10 +17,14 @@ function envInt(name: string, fallback: number): number {
 const SERVER_FILE = fileURLToPath(new URL("./pyrepl_server.py", import.meta.url))
 const DEFAULT_TIMEOUT_S = envInt("PYREPL_TIMEOUT_S", 30)
 const PREVIEW_LINES = envInt("PYREPL_PREVIEW_LINES", 100)
-const PREVIEW_HEAD = envInt("PYREPL_PREVIEW_HEAD", 2000)
-const PREVIEW_TAIL = envInt("PYREPL_PREVIEW_TAIL", 1500)
+const PREVIEW_HEAD = envInt("PYREPL_PREVIEW_HEAD", 1000)
+const PREVIEW_TAIL = envInt("PYREPL_PREVIEW_TAIL", 2500)
 const WAIT_GRACE_MS = envInt("PYREPL_WAIT_GRACE_MS", 15000)
 const RPC_TIMEOUT_MS = envInt("PYREPL_RPC_TIMEOUT_MS", 15000)
+// Notify the agent inside its own session when a background task finishes,
+// so it wakes up on its own instead of relying on manual pyrepl_read polls.
+const NOTIFY_AGENT = (process.env.PYREPL_NOTIFY_AGENT ?? "1").trim() !== "0"
+const NOTIFY_POLL_MS = envInt("PYREPL_NOTIFY_POLL_MS", 5000)
 
 type RpcPending = {
   resolve: (value: TaskResponse) => void
@@ -45,6 +49,9 @@ type TaskResponse = {
   task_id: string
   n?: number
   done?: boolean
+  elapsed_ms?: number
+  output_bytes?: number
+  output_lines?: number
   lines?: TaskLine[]
   line_count?: number
   truncated_lines?: number
@@ -78,9 +85,32 @@ type Session = {
   stderrTail: string
   freshPending: boolean
   execCount: number
+  // Task ids whose final output already reached the agent inline (foreground
+  // exec/read/interrupt): no wake-up prompt needed. Task ids already pushed
+  // via session.prompt: notify-once, prevents idle->prompt->idle loops.
+  consumed: Set<string>
+  notified: Set<string>
 }
 
 const sessions = new Map<string, Session>()
+// Background tasks whose wake-up prompt failed to admit (e.g. session
+// gone): retried on the next session.idle event. Values carry the agent
+// so the retry wakes up as the same agent.
+const pendingNotify = new Map<string, Map<string, string | undefined>>()
+
+// Minimal client surface used for agent wake-ups (full SDK client in prod).
+type NotifyClient = {
+  session: {
+    promptAsync: (opts: {
+      path: { id: string }
+      body: { parts: Array<{ type: "text"; text: string; synthetic?: boolean }>; agent?: string }
+    }) => Promise<unknown>
+  }
+}
+
+function isTerminalTaskStatus(status: string | undefined): boolean {
+  return status !== undefined && status !== "running"
+}
 
 async function existsExecutable(file: string): Promise<boolean> {
   try {
@@ -210,6 +240,8 @@ async function spawnSession(bin: string, version: string): Promise<Session> {
     stderrTail: "",
     freshPending: true,
     execCount: 0,
+    consumed: new Set(),
+    notified: new Set(),
   }
   drainStderr(session, proc.stderr)
   pumpStdout(session, proc.stdout)
@@ -479,18 +511,112 @@ function extractSessionId(props: Record<string, any>): string | undefined {
   return typeof id === "string" ? id : undefined
 }
 
-export const PyReplPlugin: Plugin = async (_ctx) => {
+// Short wake-up: both id forms plus cost facts, no output dump. The agent
+// pulls the output itself with pyrepl_read.
+function formatCompletionNotice(taskId: string, res: TaskResponse): string {
+  const out = [
+    `[pyrepl: background task done: task_id=${taskId} (exec #${res.n}), status=${res.status}, elapsed=${res.elapsed_ms ?? "?"}ms, output=${res.output_lines ?? "?"} lines / ${res.output_bytes ?? "?"} bytes]`,
+  ]
+  if (res.error) out.push(`${res.error.type}: ${res.error.message}`)
+  out.push(`Use pyrepl_read task_id=${taskId} for the full output.`)
+  return out.join("\n")
+}
+
+// Push one finished task into the agent's session. promptAsync admits the
+// message even mid-turn (the running turn picks it up next step); on
+// admission failure park it for retry on the next session.idle event.
+async function deliverCompletion(
+  client: NotifyClient,
+  key: string,
+  taskId: string,
+  agent: string | undefined,
+): Promise<void> {
+  try {
+    const session = sessions.get(key)
+    if (!session || session.dead) return
+    if (session.consumed.has(taskId) || session.notified.has(taskId)) return
+    const res = await rpc(
+      session,
+      { op: "read", task_id: taskId, offset: 0, limit: 200, grep: null, target: "combined", tail_lines: null },
+      RPC_TIMEOUT_MS,
+    )
+    if (res?.status === "not_found" || res?.status === "error") return
+    await client.session.promptAsync({
+      path: { id: key },
+      body: {
+        parts: [{ type: "text", text: formatCompletionNotice(taskId, res), synthetic: true }],
+        ...(agent ? { agent } : {}),
+      },
+    })
+    session.notified.add(taskId)
+  } catch {
+    let set = pendingNotify.get(key)
+    if (!set) {
+      set = new Map()
+      pendingNotify.set(key, set)
+    }
+    set.set(taskId, agent)
+  }
+}
+
+// Fire-and-forget waiter armed when exec returns a running task. Exits
+// silently when the output already reached the agent another way.
+async function notifyWhenDone(
+  client: NotifyClient,
+  key: string,
+  taskId: string,
+  agent: string | undefined,
+): Promise<void> {
+  try {
+    for (;;) {
+      await new Promise((res) => setTimeout(res, NOTIFY_POLL_MS))
+      const session = sessions.get(key)
+      if (!session || session.dead) return
+      if (session.consumed.has(taskId) || session.notified.has(taskId)) return
+      let found: { task_id: string; n: number; task_status: string } | undefined
+      try {
+        const res = await rpc<TaskListResponse>(session, { op: "list" }, RPC_TIMEOUT_MS)
+        found = res?.tasks?.find((t) => t.task_id === taskId)
+      } catch {
+        return
+      }
+      if (!found || isTerminalTaskStatus(found.task_status)) break
+    }
+    await deliverCompletion(client, key, taskId, agent)
+  } catch {
+  }
+}
+
+async function flushPendingNotify(client: NotifyClient, key: string): Promise<void> {
+  const set = pendingNotify.get(key)
+  if (!set || set.size === 0) return
+  pendingNotify.delete(key)
+  if (!sessions.get(key)) return
+  for (const [taskId, agent] of set) await deliverCompletion(client, key, taskId, agent)
+}
+
+export const PyReplPlugin: Plugin = async (ctx) => {
+  const client = (ctx?.client ?? null) as NotifyClient | null
+  const canNotify = NOTIFY_AGENT && client !== null
   return {
     event: async (input: { event: unknown }) => {
       const event = input.event as { type?: string; properties?: Record<string, any> }
-      if (event?.type !== "session.deleted") return
+      if (event?.type === "session.deleted") {
+        const id = extractSessionId(event.properties ?? {})
+        if (id === undefined) return
+        const session = sessions.get(id)
+        if (session) {
+          killSession(session)
+          sessions.delete(id)
+        }
+        pendingNotify.delete(id)
+        return
+      }
+      // Retry wake-up prompts that failed while the session was busy.
+      if (event?.type !== "session.idle" || !canNotify) return
       const id = extractSessionId(event.properties ?? {})
       if (id === undefined) return
-      const session = sessions.get(id)
-      if (session) {
-        killSession(session)
-        sessions.delete(id)
-      }
+      await flushPendingNotify(client, id)
     },
     tool: {
       pyrepl_init: tool({
@@ -517,7 +643,7 @@ export const PyReplPlugin: Plugin = async (_ctx) => {
 
       pyrepl_exec: tool({
         description:
-          "Execute Python code in the persistent REPL. Variables, imports and functions survive across calls. Auto-initializes if needed. Set reset=true to wipe state and run this code as the first command in one step. If the task exceeds timeout_s it is NOT killed: exec returns a task_id, then poll with pyrepl_read or stop with pyrepl_interrupt.",
+          "Execute Python code in the persistent REPL. Variables, imports and functions survive across calls. Auto-initializes if needed. Set reset=true to wipe state and run this code as the first command in one step. If the task exceeds timeout_s it is NOT killed: exec returns a task_id and the agent is automatically notified in its session on completion (set PYREPL_NOTIFY_AGENT=0 to disable); polling with pyrepl_read stays optional.",
         args: {
           code: tool.schema.string().describe("Python source to execute."),
           reset: tool.schema
@@ -561,7 +687,12 @@ export const PyReplPlugin: Plugin = async (_ctx) => {
             session.execCount = 0
             // Task ids restart at t_1 alongside exec numbers (the server
             // drops its registry on reset), so t_N always means exec #N.
+            // Forget delivery bookkeeping with them to avoid waking the
+            // agent with stale pre-reset output under a recycled id.
             session.taskSeq = 0
+            session.consumed.clear()
+            session.notified.clear()
+            pendingNotify.delete(key)
           }
           session.taskSeq += 1
           const taskId = `t_${session.taskSeq}`
@@ -576,6 +707,17 @@ export const PyReplPlugin: Plugin = async (_ctx) => {
           }
           const res = outcome.value
           if (args.reset) session.execCount = res?.n ?? 1
+          if (res?.status === "running" && res?.task_id) {
+            // Background task: wake the agent here on completion so it does
+            // not have to poll. The waiter exits silently if the output
+            // reaches the agent first via pyrepl_read/pyrepl_interrupt.
+            if (canNotify) void notifyWhenDone(client, key, res.task_id, context.agent || undefined)
+            const out = formatExecResult(res, session, freshNote)
+            return canNotify
+              ? `${out}\n[pyrepl: I will notify you in this session when task ${res.task_id} finishes; polling with pyrepl_read is optional]`
+              : out
+          }
+          if (res?.task_id) session.consumed.add(res.task_id)
           return formatExecResult(res, session, freshNote)
         },
       }),
@@ -615,6 +757,7 @@ export const PyReplPlugin: Plugin = async (_ctx) => {
           )
           if (res?.status === "not_found") return `unknown task ${args.task_id}`
           if (res?.status === "error") return `read error: ${res.message ?? "unknown"}`
+          if (isTerminalTaskStatus(res.status) && res.task_id) session.consumed.add(res.task_id)
           const out: string[] = [`task ${res.task_id}: ${res.status} (exec #${res.n})`]
           out.push(...formatResultValue(res, "re-read with target=result for full"))
           out.push(...formatErrorLines(res, true))
@@ -679,6 +822,9 @@ export const PyReplPlugin: Plugin = async (_ctx) => {
           const res = await rpc(session, { op: "interrupt", task_id: args.task_id }, RPC_TIMEOUT_MS)
           if (res?.status === "not_found") return `unknown task ${args.task_id}`
           if (res?.status === "error") return `interrupt error: ${res.message ?? "unknown"}`
+          // The agent is present and got the partial output inline; no
+          // wake-up needed if the waiter has not fired yet.
+          if (res?.task_id) session.consumed.add(res.task_id)
           const out: string[] = [`task ${res.task_id}: ${res.status}`]
           if (res.message) out.push(res.message)
           out.push(

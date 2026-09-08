@@ -35,7 +35,7 @@ Env knobs (all optional): `PYREPL_PYTHON`, `PYREPL_TIMEOUT_S`,
 `PYREPL_PREVIEW_HEAD`, `PYREPL_PREVIEW_TAIL`, `PYREPL_MAX_LINES`,
 `PYREPL_MAX_BYTES`, `PYREPL_MAX_LINE_CHARS`, `PYREPL_MAX_GREP_CHARS`,
 `PYREPL_RESULT_MAX_CHARS`, `PYREPL_RESULT_MAX_STORE`, `PYREPL_RECENT_TASKS`,
-`PYREPL_INTERRUPT_WAIT_S`.
+`PYREPL_INTERRUPT_WAIT_S`, `PYREPL_NOTIFY_AGENT`, `PYREPL_NOTIFY_POLL_MS`.
 
 ## Tools
 
@@ -49,7 +49,9 @@ Env knobs (all optional): `PYREPL_PYTHON`, `PYREPL_TIMEOUT_S`,
 
 The first `exec` of a session notes it is fresh (state is new and dies with
 opencode). Timeouts never kill: the task keeps running until read or
-interrupted.
+interrupted. When a background task finishes, the agent is automatically
+notified in its own session with the result, so it wakes up on its own
+instead of polling (`PYREPL_NOTIFY_AGENT=0` disables this).
 
 ## How it works
 
@@ -68,7 +70,7 @@ newline-delimited JSON (`ping`, `execute`, `read`, `list`, `interrupt`,
 ## Development
 
 ```sh
-bun run typecheck   # tsc, discovered dynamically (no global install needed)
+bun run typecheck   # tsc --noEmit (typescript is a devDependency)
 bun run deploy      # install to ~/.config/opencode/plugins/
 ruff check src/     # Python lint (rule set pinned in ruff.toml)
 ```

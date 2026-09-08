@@ -20,7 +20,7 @@
   ],
   "scripts": {
     "deploy": "bun src/install.ts",
-    "typecheck": "bun src/typecheck.ts"
+    "typecheck": "tsc --noEmit"
   },
   "peerDependencies": {
     "@opencode-ai/plugin": "^1.18.29"
@@ -28,6 +28,7 @@
   "devDependencies": {
     "@opencode-ai/plugin": "1.18.29",
     "@types/node": "26.2.0",
+    "typescript": "^7.0.2",
     "zod": "4.1.8"
   }
 }

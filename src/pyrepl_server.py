@@ -91,9 +91,14 @@ class LineBuffer:
         self._bytes = 0
         self._lock = threading.Lock()
         self.dropped = 0
+        # Lifetime totals (pre-eviction): the true output size even when the
+        # ring already dropped the oldest entries.
+        self.total_bytes = 0
+        self.total_lines = 0
 
-    def _push(self, stream, text):
-        size = len(text.encode("utf-8"))
+    def _push(self, stream, text, size=None):
+        if size is None:
+            size = len(text.encode("utf-8"))
         if len(self._buf) >= self._maxlen:
             old = self._buf.popleft()
             self._bytes -= len(old[1].encode("utf-8"))
@@ -106,7 +111,13 @@ class LineBuffer:
             self.dropped += 1
 
     def append(self, stream, text):
+        self.total_lines += 1
+        encoded = text.encode("utf-8")
+        self.total_bytes += len(encoded)
         with self._lock:
+            if len(text) <= self._max_line:
+                self._push(stream, text, len(encoded))
+                return
             while len(text) > self._max_line:
                 self._push(stream, text[: self._max_line] + " [line split]")
                 text = text[self._max_line :]
@@ -161,11 +172,19 @@ class Task:
         self.error = None
         self.done = threading.Event()
         self.thread = None
+        self.started = time.monotonic()
+        self.ended = None
         # Guards status/thread-identity checks so interrupt() can never
         # inject into a recycled thread. The worker sets its terminal status
         # under this lock before exiting; interrupt() only injects while the
         # task still reports running under the same lock.
         self.lock = threading.Lock()
+
+    def finish(self, status):
+        with self.lock:
+            self.status = status
+            if self.ended is None:
+                self.ended = time.monotonic()
 
 
 class ReplServer:
@@ -222,7 +241,7 @@ class ReplServer:
                         "message": str(sys.exc_info()[1]),
                         "traceback": traceback.format_exc(),
                     }
-                    task.status = "error"
+                task.finish("error")
                 return
             if node.body and isinstance(node.body[-1], ast.Expr):
                 last = node.body[-1]
@@ -239,8 +258,7 @@ class ReplServer:
                 task.has_result = True
             else:
                 exec(compile(node, "<repl>", "exec"), self.namespace)  # executing code is this server's purpose
-            with task.lock:
-                task.status = "done"
+            task.finish("done")
         except KeyboardInterrupt:
             with task.lock:
                 task.error = {
@@ -248,7 +266,7 @@ class ReplServer:
                     "message": "execution interrupted",
                     "traceback": traceback.format_exc(),
                 }
-                task.status = "interrupted"
+            task.finish("interrupted")
         except BaseException:  # user code must never kill the session
             with task.lock:
                 task.error = {
@@ -256,7 +274,7 @@ class ReplServer:
                     "message": str(sys.exc_info()[1]),
                     "traceback": traceback.format_exc(),
                 }
-                task.status = "error"
+            task.finish("error")
         finally:
             try:
                 out.flush()
@@ -276,6 +294,8 @@ class ReplServer:
                 with task.lock:
                     if task.status == "running":
                         task.status = "interrupted"
+                        if task.ended is None:
+                            task.ended = time.monotonic()
                 task.done.set()
 
     def _reader_loop(self):
@@ -404,12 +424,16 @@ class ReplServer:
 
     def _task_payload(self, task, include_lines=False, offset=0, limit=200):
         lines, dropped = task.buffer.snapshot()
+        ended = task.ended if task.ended is not None else time.monotonic()
         payload = {
             "status": task.status,
             "task_id": task.task_id,
             "n": task.n,
             "truncated_lines": dropped,
             "done": task.status != "running",
+            "elapsed_ms": int((ended - task.started) * 1000),
+            "output_bytes": task.buffer.total_bytes,
+            "output_lines": task.buffer.total_lines,
         }
         if task.has_result:
             preview, cut = self._preview_result(task.result)
