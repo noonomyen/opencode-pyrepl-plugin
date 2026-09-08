@@ -761,6 +761,7 @@ async function notifyWhenDone(
   const armedSeq = armed?.resetSeq ?? -1
   const cadence = Number.isFinite(progressS) && progressS > 0 ? progressS : 0
   let nextProgress = cadence > 0 ? Date.now() + cadence * 1000 : 0
+  let listFails = 0
   try {
     for (;;) {
       await new Promise((res) => setTimeout(res, NOTIFY_POLL_MS))
@@ -776,8 +777,20 @@ async function notifyWhenDone(
         const res = await rpc<TaskListResponse>(session, { op: "list" }, RPC_TIMEOUT_MS)
         found = res?.tasks?.find((t) => t.task_id === taskId)
       } catch {
-        return
+        // The list RPC itself failed: only a dead server is conclusive
+        // (deliverCompletion reports it lost); a live one may be transient,
+        // so keep polling instead of waking the agent wrongly. Give up
+        // after ~60s of consecutive failures so a wedged pipe cannot park
+        // a waiter forever.
+        if (session.dead) {
+          await deliverCompletion(client, key, taskId, agent)
+          return
+        }
+        listFails += 1
+        if (listFails >= 12) return
+        continue
       }
+      listFails = 0
       if (!found || isTerminalTaskStatus(found.task_status)) break
       if (nextProgress > 0 && Date.now() >= nextProgress) {
         nextProgress += cadence * 1000
@@ -907,7 +920,7 @@ export const PyReplPlugin: Plugin = async (ctx) => {
         async execute(args, context: ToolContext) {
           context.metadata({ title: "pyrepl exec" })
           const key = context.sessionID
-          const timeoutS = args.timeout_s ?? DEFAULT_TIMEOUT_S
+          const timeoutS = Number.isFinite(args.timeout_s) ? (args.timeout_s as number) : DEFAULT_TIMEOUT_S
           const waitMs = Math.max(100, Math.floor(timeoutS * 1000))
           // Never re-resolve over a live session: the interpreter chosen by
           // pyrepl_init (or the first auto-init) sticks until the process dies.

@@ -90,5 +90,6 @@ newline-delimited JSON (`ping`, `execute`, `read`, `list`, `interrupt`,
 ```sh
 bun run typecheck   # tsc --noEmit (typescript is a devDependency)
 bun run deploy      # install to ~/.config/opencode/plugins/
+bun test tests/     # bun:test suites (protocol/tools fast, slow every run)
 ruff check src/     # Python lint (rule set pinned in ruff.toml)
 ```

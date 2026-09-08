@@ -1,0 +1,23 @@
+name: ci
+on:
+  push:
+    branches: [master]
+  pull_request:
+env:
+  PYTHONUTF8: "1"
+  LC_ALL: C.UTF-8
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: bun install --frozen-lockfile
+      - run: bun run typecheck
+      - run: pipx run ruff check src/
+      - run: bun test tests/

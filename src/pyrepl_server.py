@@ -237,7 +237,13 @@ def _apply_limits():
 
 
 def _check_mem_warn(task):
-    """One-shot RSS warning for a running task. Warn-only, never kills."""
+    """One-shot RSS warning for a running task. Warn-only, never kills.
+
+    Compares high-water GROWTH since the task started (not the absolute
+    high-water, which earlier tasks may have left behind), so an innocent
+    long task after a big transient alloc does not warn by association.
+    Only fires for tasks alive past one wait slice (~0.1s).
+    """
     if task.mem_warned is not None or MEM_WARN_PCT <= 0:
         return
     if MAX_MEM_MB <= 0 or not _HAVE_GETRUSAGE:
@@ -247,9 +253,10 @@ def _check_mem_warn(task):
         if current is None:
             return
         cap = MAX_MEM_MB * 1024 * 1024
-        if current > cap * MEM_WARN_PCT // 100:
+        base = task.peak_start or 0
+        if current - base > cap * MEM_WARN_PCT // 100:
             task.mem_warned = (
-                f"RSS {current // 1048576}MB > {MEM_WARN_PCT}% of {MAX_MEM_MB}MB limit"
+                f"RSS +{(current - base) // 1048576}MB this task > {MEM_WARN_PCT}% of {MAX_MEM_MB}MB limit"
             )
     except Exception:
         pass
@@ -267,6 +274,12 @@ def _respond(payload):
             return
     sys.__stdout__.write(text + "\n")
     sys.__stdout__.flush()
+
+
+def _utf8_len(text):
+    """Byte length for buffer accounting. surrogatepass keeps lone
+    surrogates (agent printing weird data) from crashing the task."""
+    return len(text.encode("utf-8", "surrogatepass"))
 
 
 class LineBuffer:
@@ -291,25 +304,25 @@ class LineBuffer:
 
     def _push(self, stream, text, size=None):
         if size is None:
-            size = len(text.encode("utf-8"))
+            size = _utf8_len(text)
         if len(self._buf) >= self._maxlen:
             old = self._buf.popleft()
-            self._bytes -= len(old[1].encode("utf-8"))
+            self._bytes -= _utf8_len(old[1])
             self.dropped += 1
         self._buf.append((stream, text))
         self._bytes += size
         while self._bytes > self._max_bytes and len(self._buf) > 1:
             old = self._buf.popleft()
-            self._bytes -= len(old[1].encode("utf-8"))
+            self._bytes -= _utf8_len(old[1])
             self.dropped += 1
 
     def append(self, stream, text):
         self.total_lines += 1
-        encoded = text.encode("utf-8")
-        self.total_bytes += len(encoded)
+        encoded_len = _utf8_len(text)
+        self.total_bytes += encoded_len
         with self._lock:
             if len(text) <= self._max_line:
-                self._push(stream, text, len(encoded))
+                self._push(stream, text, encoded_len)
                 return
             while len(text) > self._max_line:
                 self._push(stream, text[: self._max_line] + " [line split]")
@@ -826,8 +839,17 @@ class ReplServer:
         if tail_lines:
             lines = lines[-tail_lines:]
         else:
-            offset = req.get("offset", 0) or 0
-            limit = req.get("limit", 200) or 200
+            try:
+                offset = max(0, int(req.get("offset", 0) or 0))
+            except (TypeError, ValueError):
+                offset = 0
+            try:
+                limit = int(req.get("limit", 200) or 200)
+            except (TypeError, ValueError):
+                limit = 200
+            limit = min(limit, 5000)
+            if limit < 1:
+                limit = 200
             lines = lines[offset : offset + limit]
         payload = self._task_payload(task)
         payload["lines"] = [{"stream": s, "line": line} for s, line in lines]
