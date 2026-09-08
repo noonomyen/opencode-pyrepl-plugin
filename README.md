@@ -4,9 +4,9 @@ Local opencode plugin giving the agent a stateful Python REPL. Variables,
 imports and functions survive across calls, so the agent can iterate like a
 notebook instead of re-running everything from scratch.
 
-> Note: implemented and tested on the Bun runtime. The TypeScript side uses
-> Bun APIs (`Bun.spawn`, `Bun.FileSink`); running under plain Node.js is not
-> supported.
+> Note: runtime-agnostic TypeScript. It uses only `node:` built-ins
+> (`node:child_process`, `node:stream`), so it runs on Bun and on recent
+> Node.js with native type stripping. No Bun APIs are used anywhere.
 
 ## Install
 
@@ -31,10 +31,11 @@ install` needed; the only runtime dependency (`@opencode-ai/plugin`) is
 provided by opencode itself.
 
 Env knobs (all optional): `PYREPL_PYTHON`, `PYREPL_TIMEOUT_S`,
-`PYREPL_WAIT_GRACE_MS`, `PYREPL_PREVIEW_LINES`, `PYREPL_PREVIEW_HEAD`,
-`PYREPL_PREVIEW_TAIL`, `PYREPL_MAX_LINES`, `PYREPL_MAX_BYTES`,
-`PYREPL_MAX_LINE_CHARS`, `PYREPL_RESULT_MAX_CHARS`, `PYREPL_RESULT_MAX_STORE`,
-`PYREPL_RECENT_TASKS`.
+`PYREPL_WAIT_GRACE_MS`, `PYREPL_RPC_TIMEOUT_MS`, `PYREPL_PREVIEW_LINES`,
+`PYREPL_PREVIEW_HEAD`, `PYREPL_PREVIEW_TAIL`, `PYREPL_MAX_LINES`,
+`PYREPL_MAX_BYTES`, `PYREPL_MAX_LINE_CHARS`, `PYREPL_MAX_GREP_CHARS`,
+`PYREPL_RESULT_MAX_CHARS`, `PYREPL_RESULT_MAX_STORE`, `PYREPL_RECENT_TASKS`,
+`PYREPL_INTERRUPT_WAIT_S`.
 
 ## Tools
 
@@ -63,3 +64,11 @@ newline-delimited JSON (`ping`, `execute`, `read`, `list`, `interrupt`,
 - No magics, no inline plots (`Agg` + save-to-file), no `input()`/`pdb`.
 - `interrupt` stops Python-level loops instantly; stuck native calls
   (e.g. `time.sleep`) need a respawn.
+
+## Development
+
+```sh
+bun run typecheck   # tsc, discovered dynamically (no global install needed)
+bun run deploy      # install to ~/.config/opencode/plugins/
+ruff check src/     # Python lint (rule set pinned in ruff.toml)
+```

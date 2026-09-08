@@ -59,6 +59,7 @@ MAX_GREP_CHARS = _env_int("PYREPL_MAX_GREP_CHARS", 500)
 RESULT_MAX_CHARS = _env_int("PYREPL_RESULT_MAX_CHARS", 4000)
 RESULT_MAX_STORE = _env_int("PYREPL_RESULT_MAX_STORE", 1000000)
 RECENT_TASKS = _env_int("PYREPL_RECENT_TASKS", 20)
+INTERRUPT_WAIT_S = _env_int("PYREPL_INTERRUPT_WAIT_S", 5)
 
 
 def _respond(payload):
@@ -164,7 +165,7 @@ class Task:
         # inject into a recycled thread. The worker sets its terminal status
         # under this lock before exiting; interrupt() only injects while the
         # task still reports running under the same lock.
-        self.mu = threading.Lock()
+        self.lock = threading.Lock()
 
 
 class ReplServer:
@@ -215,7 +216,7 @@ class ReplServer:
             try:
                 node = ast.parse(task.code, mode="exec")
             except SyntaxError:
-                with task.mu:
+                with task.lock:
                     task.error = {
                         "type": "SyntaxError",
                         "message": str(sys.exc_info()[1]),
@@ -228,28 +229,28 @@ class ReplServer:
                 body = node.body[:-1]
                 if body:
                     module = ast.Module(body=body, type_ignores=[])
-                    exec(compile(module, "<repl>", "exec"), self.namespace)  # noqa: S102
+                    exec(compile(module, "<repl>", "exec"), self.namespace)  # executing code is this server's purpose
                 expr = ast.Expression(body=last.value)
                 value = eval(compile(expr, "<repl>", "eval"), self.namespace)
                 try:
                     task.result = repr(value)
-                except Exception:  # noqa: BLE001 -- arbitrary __repr__ may raise anything
+                except Exception:  # arbitrary __repr__ may raise anything; keep the value anyway
                     task.result = f"<repr failed: {type(value).__name__}>"
                 task.has_result = True
             else:
-                exec(compile(node, "<repl>", "exec"), self.namespace)  # noqa: S102
-            with task.mu:
+                exec(compile(node, "<repl>", "exec"), self.namespace)  # executing code is this server's purpose
+            with task.lock:
                 task.status = "done"
         except KeyboardInterrupt:
-            with task.mu:
+            with task.lock:
                 task.error = {
                     "type": "KeyboardInterrupt",
                     "message": "execution interrupted",
                     "traceback": traceback.format_exc(),
                 }
                 task.status = "interrupted"
-        except BaseException:  # noqa: BLE001 -- user code must never kill the session
-            with task.mu:
+        except BaseException:  # user code must never kill the session
+            with task.lock:
                 task.error = {
                     "type": type(sys.exc_info()[1]).__name__,
                     "message": str(sys.exc_info()[1]),
@@ -272,7 +273,7 @@ class ReplServer:
             finally:
                 # An interrupt landing inside this cleanup must not leave the
                 # task stuck: never report running once the thread is gone.
-                with task.mu:
+                with task.lock:
                     if task.status == "running":
                         task.status = "interrupted"
                 task.done.set()
@@ -333,6 +334,28 @@ class ReplServer:
                 return True
             self._pump_pending()
 
+    def _answer_inflight(self, req, task):
+        """Best-effort response for a request abandoned by shutdown/EOF.
+
+        _pump_pending raises SystemExit when EOF lands mid-wait; without
+        this, the in-flight execute/interrupt would never get a response
+        and the client would hang until its own timeout.
+        """
+        try:
+            if task.done.is_set():
+                body = self._task_payload(task, include_lines=True)
+            else:
+                body = {
+                    "status": "running",
+                    "task_id": task.task_id,
+                    "n": task.n,
+                    "message": "server is shutting down; the task will not complete",
+                }
+            body["id"] = req.get("id")
+            _respond(body)
+        except OSError:
+            pass  # output pipe already gone; exiting anyway
+
     def handle_execute(self, req):
         code = req.get("code", "")
         task_id = req.get("task_id") or f"t_{self.exec_count + 1}"
@@ -350,7 +373,12 @@ class ReplServer:
         thread = threading.Thread(target=self._run_task, args=(task,), daemon=True)
         task.thread = thread
         thread.start()
-        if self._wait_for(task, max(0, wait_ms) / 1000.0):
+        try:
+            finished = self._wait_for(task, max(0, wait_ms) / 1000.0)
+        except SystemExit:
+            self._answer_inflight(req, task)
+            raise
+        if finished:
             return self._task_payload(task, include_lines=True)
         return {
             "status": "running",
@@ -423,7 +451,7 @@ class ReplServer:
         if target == "result":
             full = task.result if task.has_result else None
             if full is not None and pattern is not None:
-                full = "\n".join(l for l in full.split("\n") if pattern.search(l))
+                full = "\n".join(line for line in full.split("\n") if pattern.search(line))
             payload = self._task_payload(task)
             payload["result_full"] = full
             return payload
@@ -432,9 +460,9 @@ class ReplServer:
         else:
             lines, dropped = task.buffer.snapshot()
         if target in ("stdout", "stderr"):
-            lines = [(s, l) for s, l in lines if s == target]
+            lines = [(s, line) for s, line in lines if s == target]
         if pattern is not None:
-            lines = [(s, l) for s, l in lines if pattern.search(l)]
+            lines = [(s, line) for s, line in lines if pattern.search(line)]
         tail_lines = req.get("tail_lines")
         if tail_lines:
             lines = lines[-tail_lines:]
@@ -443,7 +471,7 @@ class ReplServer:
             limit = req.get("limit", 200) or 200
             lines = lines[offset : offset + limit]
         payload = self._task_payload(task)
-        payload["lines"] = [{"stream": s, "line": l} for s, l in lines]
+        payload["lines"] = [{"stream": s, "line": line} for s, line in lines]
         payload["returned"] = len(lines)
         if target == "orphan":
             payload["orphan_truncated_lines"] = dropped
@@ -453,7 +481,7 @@ class ReplServer:
         task = self._get_task(req.get("task_id", ""))
         if task is None:
             return {"status": "not_found", "message": "unknown task_id"}
-        with task.mu:
+        with task.lock:
             if task.status != "running" or task.thread is None or not task.thread.is_alive():
                 finished = True
             else:
@@ -481,7 +509,11 @@ class ReplServer:
             payload = self._task_payload(task, include_lines=True)
             payload["message"] = "task already finished"
             return payload
-        self._wait_for(task, 5.0)
+        try:
+            self._wait_for(task, INTERRUPT_WAIT_S)
+        except SystemExit:
+            self._answer_inflight(req, task)
+            raise
         payload = self._task_payload(task, include_lines=True)
         return payload
 
@@ -539,7 +571,7 @@ class ReplServer:
                 body = {"status": "error", "message": f"unknown op: {op!r}"}
         except SystemExit:
             raise
-        except Exception as exc:  # noqa: BLE001 -- protocol boundary must never crash
+        except Exception as exc:  # protocol boundary must never crash
             body = {"status": "error", "message": f"server error: {exc}"}
         body["id"] = req_id
         return body

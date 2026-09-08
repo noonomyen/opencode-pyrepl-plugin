@@ -1,4 +1,4 @@
-#!/usr/bin/env bun
+#!/usr/bin/env node
 /** Typechecks the project without hardcoded toolchain paths.
  *
  * Locates tsc in order: ./node_modules/.bin/tsc, tsc on PATH, then the
@@ -10,6 +10,7 @@ import { constants } from "node:fs"
 import { homedir } from "node:os"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
+import { spawn, spawnSync } from "node:child_process"
 
 const ROOT = path.dirname(fileURLToPath(new URL(".", import.meta.url)))
 
@@ -26,12 +27,11 @@ async function findTsc(): Promise<string | null> {
   const local = path.join(ROOT, "node_modules", ".bin", "tsc")
   if (await exists(local)) return local
   try {
-    const which = Bun.spawnSync(
-      [process.platform === "win32" ? "where" : "which", "tsc"],
-      { stdout: "pipe" },
-    )
-    const onPath = new TextDecoder().decode(which.stdout).trim().split("\n")[0]
-    if (which.exitCode === 0 && onPath && (await exists(onPath))) return onPath
+    const which = spawnSync(process.platform === "win32" ? "where" : "which", ["tsc"], {
+      encoding: "utf-8",
+    })
+    const onPath = (which.stdout ?? "").trim().split("\n")[0]
+    if (which.status === 0 && onPath && (await exists(onPath))) return onPath
   } catch {
   }
   const bunHome = process.env.BUN_INSTALL?.trim() || path.join(homedir(), ".bun")
@@ -54,9 +54,8 @@ if (!tsc) {
 }
 console.log(`typecheck: using ${tsc}`)
 // Run under the current runtime instead of hardcoding `node`.
-const proc = Bun.spawn([process.execPath, tsc, "--noEmit"], {
+const proc = spawn(process.execPath, [tsc, "--noEmit"], {
   cwd: ROOT,
-  stdout: "inherit",
-  stderr: "inherit",
+  stdio: "inherit",
 })
-process.exit(await proc.exited)
+proc.on("exit", (code) => process.exit(code ?? 1))

@@ -18,9 +18,6 @@
     "src/",
     "README.md"
   ],
-  "engines": {
-    "bun": ">=1.0"
-  },
   "scripts": {
     "deploy": "bun src/install.ts",
     "typecheck": "bun src/typecheck.ts"
@@ -31,7 +28,6 @@
   "devDependencies": {
     "@opencode-ai/plugin": "1.18.29",
     "@types/node": "26.2.0",
-    "bun-types": "1.3.14",
     "zod": "4.1.8"
   }
 }

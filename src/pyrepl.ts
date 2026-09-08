@@ -4,6 +4,8 @@ import { fileURLToPath } from "node:url"
 import { access } from "node:fs/promises"
 import { constants } from "node:fs"
 import path from "node:path"
+import { spawn, type ChildProcess } from "node:child_process"
+import type { Readable, Writable } from "node:stream"
 
 function envInt(name: string, fallback: number): number {
   const raw = process.env[name]?.trim()
@@ -18,20 +20,57 @@ const PREVIEW_LINES = envInt("PYREPL_PREVIEW_LINES", 100)
 const PREVIEW_HEAD = envInt("PYREPL_PREVIEW_HEAD", 2000)
 const PREVIEW_TAIL = envInt("PYREPL_PREVIEW_TAIL", 1500)
 const WAIT_GRACE_MS = envInt("PYREPL_WAIT_GRACE_MS", 15000)
+const RPC_TIMEOUT_MS = envInt("PYREPL_RPC_TIMEOUT_MS", 15000)
 
-type Pending = {
-  resolve: (value: any) => void
+type RpcPending = {
+  resolve: (value: TaskResponse) => void
   reject: (err: Error) => void
+}
+
+type TaskLine = {
+  stream: string
+  line: string
+}
+
+type TaskError = {
+  type: string
+  message: string
+  traceback?: string
+}
+
+// One shape for every task-related RPC response (execute/read/interrupt).
+// Optional fields because each op fills a different subset.
+type TaskResponse = {
+  status: string
+  task_id: string
+  n?: number
+  done?: boolean
+  lines?: TaskLine[]
+  line_count?: number
+  truncated_lines?: number
+  orphan_new?: number
+  orphan_truncated_lines?: number
+  result_preview?: string
+  result_chars?: number
+  result_truncated?: boolean
+  result_full?: string | null
+  error?: TaskError
+  message?: string
+}
+
+type TaskListResponse = {
+  status: string
+  tasks?: Array<{ task_id: string; n: number; task_status: string }>
 }
 
 type Session = {
   bin: string
   version: string
-  proc: Bun.Subprocess
-  writer: Bun.FileSink
+  proc: ChildProcess
+  writer: Writable
   nextId: number
   taskSeq: number
-  pending: Map<number, Pending>
+  pending: Map<number, RpcPending>
   buffer: string
   decoder: TextDecoder
   dead: boolean
@@ -53,18 +92,28 @@ async function existsExecutable(file: string): Promise<boolean> {
 }
 
 async function probePython(bin: string): Promise<{ ok: boolean; version: string }> {
-  try {
-    const proc = Bun.spawn([bin, "--version"], { stdout: "pipe", stderr: "pipe" })
-    const [out, err, code] = await Promise.all([
-      new Response(proc.stdout).text(),
-      new Response(proc.stderr).text(),
-      proc.exited,
-    ])
-    if (code !== 0) return { ok: false, version: "" }
-    return { ok: true, version: (out + err).trim().split("\n")[0] ?? bin }
-  } catch {
-    return { ok: false, version: "" }
-  }
+  return new Promise((resolve) => {
+    let proc: ChildProcess
+    try {
+      proc = spawn(bin, ["--version"], { stdio: ["ignore", "pipe", "pipe"] })
+    } catch {
+      resolve({ ok: false, version: "" })
+      return
+    }
+    let out = ""
+    let err = ""
+    proc.stdout?.on("data", (chunk: unknown) => {
+      out += String(chunk)
+    })
+    proc.stderr?.on("data", (chunk: unknown) => {
+      err += String(chunk)
+    })
+    proc.on("error", () => resolve({ ok: false, version: "" }))
+    proc.on("exit", (code) => {
+      if (code !== 0) resolve({ ok: false, version: "" })
+      else resolve({ ok: true, version: (out + err).trim().split("\n")[0] ?? bin })
+    })
+  })
 }
 
 async function resolveBin(explicit: string | undefined, ctx: ToolContext): Promise<string> {
@@ -80,54 +129,48 @@ async function resolveBin(explicit: string | undefined, ctx: ToolContext): Promi
   return "python3"
 }
 
-function drainStderr(session: Session, proc: Bun.Subprocess) {
-  if (!proc.stderr || typeof proc.stderr === "number") return
+function drainStderr(session: Session, stderr: Readable | null) {
+  if (!stderr) return
   ;(async () => {
-    const reader = (proc.stderr as ReadableStream<Uint8Array>).getReader()
     const decoder = new TextDecoder()
     try {
-      for (;;) {
-        const { done, value } = await reader.read()
-        if (done) break
-        session.stderrTail = (session.stderrTail + decoder.decode(value, { stream: true })).slice(-4096)
+      for await (const chunk of stderr) {
+        session.stderrTail = (session.stderrTail + decoder.decode(chunk, { stream: true })).slice(-4096)
       }
     } catch {
-    } finally {
-      reader.releaseLock()
     }
   })()
 }
 
-function pumpStdout(session: Session, proc: Bun.Subprocess) {
-  if (!proc.stdout || typeof proc.stdout === "number") return
+function handleLine(session: Session, line: string) {
+  if (!line.trim()) return
+  let msg: { id?: number } & Partial<TaskResponse>
+  try {
+    msg = JSON.parse(line)
+  } catch {
+    return
+  }
+  if (msg.id === undefined) return
+  const pend = session.pending.get(msg.id)
+  if (pend) {
+    session.pending.delete(msg.id)
+    pend.resolve(msg as TaskResponse)
+  }
+}
+
+function pumpStdout(session: Session, stdout: Readable | null) {
+  if (!stdout) return
   ;(async () => {
-    const reader = (proc.stdout as ReadableStream<Uint8Array>).getReader()
     try {
-      for (;;) {
-        const { done, value } = await reader.read()
-        if (done) break
-        session.buffer += session.decoder.decode(value, { stream: true })
+      for await (const chunk of stdout) {
+        session.buffer += session.decoder.decode(chunk, { stream: true })
         let idx: number
         while ((idx = session.buffer.indexOf("\n")) >= 0) {
-          const line = session.buffer.slice(0, idx)
+          handleLine(session, session.buffer.slice(0, idx))
           session.buffer = session.buffer.slice(idx + 1)
-          if (!line.trim()) continue
-          let msg: any
-          try {
-            msg = JSON.parse(line)
-          } catch {
-            continue
-          }
-          const pend = session.pending.get(msg.id)
-          if (pend) {
-            session.pending.delete(msg.id)
-            pend.resolve(msg)
-          }
         }
       }
     } catch {
-    } finally {
-      reader.releaseLock()
     }
     for (const [, pend] of session.pending) {
       pend.reject(new Error("repl server closed stdout"))
@@ -136,17 +179,27 @@ function pumpStdout(session: Session, proc: Bun.Subprocess) {
   })()
 }
 
-async function spawnSession(bin: string, version: string): Promise<Session> {
-  const proc = Bun.spawn([bin, SERVER_FILE], {
-    stdin: "pipe",
-    stdout: "pipe",
-    stderr: "pipe",
+function spawnServerProcess(bin: string): { proc: ChildProcess; exited: Promise<number> } {
+  const proc = spawn(bin, [SERVER_FILE], { stdio: ["pipe", "pipe", "pipe"] })
+  const exited = new Promise<number>((resolve) => {
+    proc.on("error", () => resolve(-1))
+    proc.on("exit", (code) => resolve(code ?? -1))
   })
+  return { proc, exited }
+}
+
+async function spawnSession(bin: string, version: string): Promise<Session> {
+  const { proc, exited } = spawnServerProcess(bin)
+  const stdin = proc.stdin
+  if (!stdin) {
+    proc.kill("SIGKILL")
+    throw new Error(`repl server has no stdin (bin=${bin})`)
+  }
   const session: Session = {
     bin,
     version,
     proc,
-    writer: proc.stdin as Bun.FileSink,
+    writer: stdin,
     nextId: 1,
     taskSeq: 0,
     pending: new Map(),
@@ -158,21 +211,32 @@ async function spawnSession(bin: string, version: string): Promise<Session> {
     freshPending: true,
     execCount: 0,
   }
-  drainStderr(session, proc)
-  pumpStdout(session, proc)
-  proc.exited.then((code) => {
+  drainStderr(session, proc.stderr)
+  pumpStdout(session, proc.stdout)
+  exited.then((code) => {
     session.dead = true
     session.exitCode = code
   })
-  const pong = await rpc(session, { op: "ping" }, 10000)
+  const pong = await rpc(session, { op: "ping" }, RPC_TIMEOUT_MS)
   if (pong?.status !== "ok") {
-    proc.kill()
+    proc.kill("SIGKILL")
     throw new Error(`repl server failed to start (bin=${bin}): ${session.stderrTail}`)
   }
   return session
 }
 
-function rpc(session: Session, body: Record<string, any>, timeoutMs: number, signal?: AbortSignal): Promise<any> {
+// Write one line, awaiting the stream flush callback so delivery to the
+// subprocess stdin pipe is guaranteed before returning.
+function writeLine(writer: Writable, line: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    writer.write(line, (err) => {
+      if (err) reject(err instanceof Error ? err : new Error(String(err)))
+      else resolve()
+    })
+  })
+}
+
+function rpc<T = TaskResponse>(session: Session, body: Record<string, any>, timeoutMs: number, signal?: AbortSignal): Promise<T> {
   const id = session.nextId++
   return new Promise((resolve, reject) => {
     let settled = false
@@ -201,11 +265,11 @@ function rpc(session: Session, body: Record<string, any>, timeoutMs: number, sig
     }
     signal?.addEventListener("abort", onAbort, { once: true })
     session.pending.set(id, {
-      resolve: (v) => {
+      resolve: (v: TaskResponse) => {
         if (settled) return
         settled = true
         cleanup()
-        resolve(v)
+        resolve(v as T)
       },
       reject: (e) => {
         if (settled) return
@@ -215,8 +279,12 @@ function rpc(session: Session, body: Record<string, any>, timeoutMs: number, sig
       },
     })
     try {
-      session.writer.write(JSON.stringify({ ...body, id }) + "\n")
-      session.writer.flush()
+      void writeLine(session.writer, JSON.stringify({ ...body, id }) + "\n").catch((e: unknown) => {
+        if (settled) return
+        settled = true
+        cleanup()
+        reject(e instanceof Error ? e : new Error(String(e)))
+      })
     } catch (e) {
       if (settled) return
       settled = true
@@ -231,7 +299,7 @@ async function rpcAbortable(
   body: Record<string, any>,
   timeoutMs: number,
   abort: AbortSignal,
-): Promise<{ aborted: boolean; value?: any }> {
+): Promise<{ aborted: true; value?: undefined } | { aborted: false; value: TaskResponse }> {
   try {
     return { aborted: false, value: await rpc(session, body, timeoutMs, abort) }
   } catch (e) {
@@ -329,7 +397,56 @@ function truncatePreview(text: string): { text: string; cut: boolean } {
   return { text: out, cut: lines.length > PREVIEW_LINES }
 }
 
-function formatExecResult(res: any, session: Session, freshNote: string | null): string {
+function formatOutputPreview(
+  res: TaskResponse,
+  label: string,
+  cutHint: string,
+  extraCut = false,
+): string[] {
+  const body = formatLines(res.lines ?? [], label)
+  if (!body) return []
+  const t = truncatePreview(body)
+  const out = [t.text]
+  if (t.cut || extraCut) out.push(cutHint)
+  return out
+}
+
+function formatResultValue(res: TaskResponse, fullRef: string): string[] {
+  if (res.result_full !== undefined && res.result_full !== null) {
+    return [`Out[${res.n}] full (${res.result_chars} chars):`, res.result_full]
+  }
+  if (res.result_preview === undefined) return []
+  const out = [`Out[${res.n}]: ${res.result_preview}`]
+  if (res.result_truncated) {
+    out.push(`[result ${res.result_chars} chars total, ${fullRef}]`)
+  }
+  return out
+}
+
+function formatErrorLines(res: TaskResponse, withTraceback: boolean): string[] {
+  if (!res.error) return []
+  const out = [`${res.error.type}: ${res.error.message}`]
+  if (withTraceback && res.error.traceback) out.push(res.error.traceback.trim())
+  return out
+}
+
+function formatDropNotes(res: TaskResponse, includeOrphanDrops: boolean): string[] {
+  const out: string[] = []
+  if (res.truncated_lines) out.push(`[note: ${res.truncated_lines} oldest lines dropped by ring buffer]`)
+  if (includeOrphanDrops && res.orphan_truncated_lines) {
+    out.push(`[note: ${res.orphan_truncated_lines} oldest orphan lines dropped by ring buffer]`)
+  }
+  return out
+}
+
+function formatOrphanHint(res: TaskResponse, verb: string): string[] {
+  if (!res.orphan_new) return []
+  return [
+    `[note: ${res.orphan_new} lines of background-thread output arrived during this task; ${verb} with target=orphan]`,
+  ]
+}
+
+function formatExecResult(res: TaskResponse, session: Session, freshNote: string | null): string {
   const out: string[] = []
   if (freshNote) out.push(`[pyrepl: ${freshNote}]`)
   if (res.status === "running") {
@@ -341,34 +458,25 @@ function formatExecResult(res: any, session: Session, freshNote: string | null):
     return `status: busy, task ${res.task_id} is still running. ${res.message ?? ""}`.trim()
   }
   session.execCount = res.n ?? session.execCount
-  const body = formatLines(res.lines ?? [], `exec #${res.n ?? "?"}`)
-  if (body) {
-    const t = truncatePreview(body)
-    out.push(t.text)
-    if (t.cut || (res.line_count ?? 0) > PREVIEW_LINES) {
-      out.push(`... [output truncated, use pyrepl_read with task_id=${res.task_id}]`)
-    }
-  }
-  if (res.result_preview !== undefined) {
-    out.push(`Out[${res.n}]: ${res.result_preview}`)
-    if (res.result_truncated) {
-      out.push(
-        `[result ${res.result_chars} chars total, use pyrepl_read task_id=${res.task_id} target=result for full]`,
-      )
-    }
-  }
-  if (res.error) {
-    out.push(`${res.error.type}: ${res.error.message}`)
-    if (res.error.traceback) out.push(res.error.traceback.trim())
-  }
-  if (res.truncated_lines) out.push(`[note: ${res.truncated_lines} oldest lines dropped by ring buffer]`)
-  if (res.orphan_new) {
-    out.push(
-      `[note: ${res.orphan_new} lines of background-thread output arrived during this task; read with target=orphan]`,
-    )
-  }
+  out.push(
+    ...formatOutputPreview(
+      res,
+      `exec #${res.n ?? "?"}`,
+      `... [output truncated, use pyrepl_read with task_id=${res.task_id}]`,
+      (res.line_count ?? 0) > PREVIEW_LINES,
+    ),
+    ...formatResultValue(res, `use pyrepl_read task_id=${res.task_id} target=result for full`),
+    ...formatErrorLines(res, true),
+    ...formatDropNotes(res, false),
+    ...formatOrphanHint(res, "read with"),
+  )
   if (out.length === 0 || (out.length === 1 && freshNote)) out.push("(no output)")
   return out.join("\n")
+}
+
+function extractSessionId(props: Record<string, any>): string | undefined {
+  const id: unknown = props.info?.id ?? props.sessionID ?? props.sessionId ?? props.id
+  return typeof id === "string" ? id : undefined
 }
 
 export const PyReplPlugin: Plugin = async (_ctx) => {
@@ -376,9 +484,8 @@ export const PyReplPlugin: Plugin = async (_ctx) => {
     event: async (input: { event: unknown }) => {
       const event = input.event as { type?: string; properties?: Record<string, any> }
       if (event?.type !== "session.deleted") return
-      const props = event.properties ?? {}
-      const id: unknown = props.info?.id ?? props.sessionID ?? props.sessionId ?? props.id
-      if (typeof id !== "string") return
+      const id = extractSessionId(event.properties ?? {})
+      if (id === undefined) return
       const session = sessions.get(id)
       if (session) {
         killSession(session)
@@ -440,7 +547,7 @@ export const PyReplPlugin: Plugin = async (_ctx) => {
           const freshNote = consumeFreshNote(session, note, args.reset)
           if (args.reset) {
             try {
-              const rr = await rpc(session, { op: "reset" }, 10000)
+              const rr = await rpc(session, { op: "reset" }, RPC_TIMEOUT_MS)
               if (rr?.status === "busy") {
                 const busyId = rr?.task_id ? ` (task_id=${rr.task_id})` : ""
                 return `reset refused: a task is still running${busyId}. Call pyrepl_interrupt first, then retry with reset=true.`
@@ -504,43 +611,18 @@ export const PyReplPlugin: Plugin = async (_ctx) => {
               target: args.target ?? "combined",
               tail_lines: args.tail_lines ?? null,
             },
-            15000,
+            RPC_TIMEOUT_MS,
           )
           if (res?.status === "not_found") return `unknown task ${args.task_id}`
           if (res?.status === "error") return `read error: ${res.message ?? "unknown"}`
           const out: string[] = [`task ${res.task_id}: ${res.status} (exec #${res.n})`]
-          if (res.result_full !== undefined && res.result_full !== null) {
-            out.push(`Out[${res.n}] full (${res.result_chars} chars):`)
-            out.push(res.result_full)
-          } else {
-            if (res.result_preview !== undefined) {
-              out.push(`Out[${res.n}]: ${res.result_preview}`)
-              if (res.result_truncated) {
-                out.push(`[result ${res.result_chars} chars total, re-read with target=result for full]`)
-              }
-            }
-          }
-          if (res.error) {
-            out.push(`${res.error.type}: ${res.error.message}`)
-            if (res.error.traceback) out.push(res.error.traceback.trim())
-          }
-          const body = formatLines(res.lines ?? [], "output")
-          if (body) {
-            const t = truncatePreview(body)
-            out.push(t.text)
-            if (t.cut) out.push(`... [preview truncated, re-read with offset/limit]`)
-          } else if (res.status === "running") {
-            out.push("(no output yet)")
-          }
-          if (res.truncated_lines) out.push(`[note: ${res.truncated_lines} oldest lines dropped by ring buffer]`)
-          if (res.orphan_new) {
-            out.push(
-              `[note: ${res.orphan_new} lines of background-thread output arrived during this task; re-read with target=orphan]`,
-            )
-          }
-          if (res.orphan_truncated_lines) {
-            out.push(`[note: ${res.orphan_truncated_lines} oldest orphan lines dropped by ring buffer]`)
-          }
+          out.push(...formatResultValue(res, "re-read with target=result for full"))
+          out.push(...formatErrorLines(res, true))
+          const preview = formatOutputPreview(res, "output", `... [preview truncated, re-read with offset/limit]`)
+          if (preview.length > 0) out.push(...preview)
+          else if (res.status === "running") out.push("(no output yet)")
+          out.push(...formatDropNotes(res, true))
+          out.push(...formatOrphanHint(res, "re-read with"))
           return out.join("\n")
         },
       }),
@@ -562,7 +644,7 @@ export const PyReplPlugin: Plugin = async (_ctx) => {
           }
           let tasks: Array<{ task_id: string; n: number; task_status: string }> = []
           try {
-            const res = await rpc(session, { op: "list" }, 10000)
+            const res = await rpc<TaskListResponse>(session, { op: "list" }, RPC_TIMEOUT_MS)
             tasks = res?.tasks ?? []
           } catch {
             return `REPL on ${session.bin} (${session.version}) is not responding. Re-run pyrepl_init to respawn.`
@@ -594,20 +676,19 @@ export const PyReplPlugin: Plugin = async (_ctx) => {
           context.metadata({ title: `pyrepl interrupt ${args.task_id}` })
           const session = sessions.get(context.sessionID)
           if (!session || session.dead) return `no REPL session active (task ${args.task_id} unknown)`
-          const res = await rpc(session, { op: "interrupt", task_id: args.task_id }, 15000)
+          const res = await rpc(session, { op: "interrupt", task_id: args.task_id }, RPC_TIMEOUT_MS)
           if (res?.status === "not_found") return `unknown task ${args.task_id}`
           if (res?.status === "error") return `interrupt error: ${res.message ?? "unknown"}`
           const out: string[] = [`task ${res.task_id}: ${res.status}`]
           if (res.message) out.push(res.message)
-          const body = formatLines(res.lines ?? [], "partial output")
-          if (body) {
-            const t = truncatePreview(body)
-            out.push(t.text)
-            if (t.cut) out.push(`... [preview truncated, use pyrepl_read with task_id=${res.task_id}]`)
-          }
-          if (res.error) {
-            out.push(`${res.error.type}: ${res.error.message}`)
-          }
+          out.push(
+            ...formatOutputPreview(
+              res,
+              "partial output",
+              `... [preview truncated, use pyrepl_read with task_id=${res.task_id}]`,
+            ),
+          )
+          out.push(...formatErrorLines(res, false))
           return out.join("\n")
         },
       }),

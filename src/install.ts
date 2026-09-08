@@ -1,4 +1,4 @@
-#!/usr/bin/env bun
+#!/usr/bin/env node
 /** Installs the pyrepl plugin into an opencode plugin directory.
  *
  * Copies both runtime files (pyrepl.ts + pyrepl_server.py) as siblings so
