@@ -44,12 +44,12 @@ import traceback
 VERSION = "0.1.0"
 
 
-def _env_int(name, fallback):
+def _env_int(name, fallback, minimum=1):
     try:
         value = int(os.environ.get(name, "").strip() or fallback)
     except ValueError:
         return fallback
-    return value if value > 0 else fallback
+    return value if value >= minimum else fallback
 
 
 MAX_LINES = _env_int("PYREPL_MAX_LINES", 5000)
@@ -60,6 +60,130 @@ RESULT_MAX_CHARS = _env_int("PYREPL_RESULT_MAX_CHARS", 4000)
 RESULT_MAX_STORE = _env_int("PYREPL_RESULT_MAX_STORE", 1000000)
 RECENT_TASKS = _env_int("PYREPL_RECENT_TASKS", 20)
 INTERRUPT_WAIT_S = _env_int("PYREPL_INTERRUPT_WAIT_S", 5)
+MAX_MEM_MB = _env_int("PYREPL_MAX_MEM_MB", 4096, minimum=0)
+MAX_CPU_S = _env_int("PYREPL_MAX_CPU_S", 0, minimum=0)
+
+
+def _cpu_clock():
+    """Best available CPU clock for the calling thread, else None.
+
+    Prefers thread_time (per-thread) so concurrent user threads do not
+    pollute the number; the process_time fallback is process-wide and
+    overcounts when other threads burn CPU alongside the task.
+    """
+    try:
+        time.thread_time()
+    except (AttributeError, OSError, RuntimeError):
+        pass
+    else:
+        return time.thread_time
+    if hasattr(time, "process_time"):
+        return time.process_time
+    return None
+
+
+_CPU_CLOCK = _cpu_clock()
+
+try:
+    import tracemalloc as _tracemalloc
+
+    _HAVE_TRACEMALLOC = True
+except Exception:  # tracemalloc unavailable
+    _tracemalloc = None
+    _HAVE_TRACEMALLOC = False
+
+try:
+    import resource
+
+    _HAVE_GETRUSAGE = True
+except ImportError:  # non-Unix: no getrusage/setrlimit
+    resource = None  # type: ignore[no-redef]
+    _HAVE_GETRUSAGE = False
+
+# Peak-RSS source: getrusage high-water on Unix, else tracemalloc peak
+# (Python objects only, misses native allocations like numpy).
+_USE_TRACEMALLOC_PEAK = _HAVE_TRACEMALLOC and not _HAVE_GETRUSAGE
+if _USE_TRACEMALLOC_PEAK:
+    try:
+        _tracemalloc.start()
+    except Exception:
+        _USE_TRACEMALLOC_PEAK = False
+
+
+def _peak_rss_bytes():
+    """Process high-water RSS in bytes, else None. Normalizes Linux KiB vs macOS bytes."""
+    if not _HAVE_GETRUSAGE:
+        return None
+    try:
+        peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        return peak if sys.platform == "darwin" else peak * 1024
+    except Exception:
+        return None
+
+
+def _statm_bytes(index):
+    """One /proc/self/statm field (0=vsz, 1=resident) in bytes, else None."""
+    try:
+        with open("/proc/self/statm", encoding="utf-8") as handle:
+            pages = int(handle.read().split()[index])
+        return pages * os.sysconf("SC_PAGE_SIZE")
+    except Exception:
+        return None
+
+
+def _current_rss_bytes():
+    """Current RSS in bytes via /proc (Linux only), else None."""
+    return _statm_bytes(1)
+
+
+def _current_vsz_bytes():
+    """Current address-space size in bytes via /proc (Linux only), else None."""
+    return _statm_bytes(0)
+
+
+def _apply_limits():
+    """Enforce mem/cpu caps via setrlimit where the platform allows.
+
+    Returns a dict describing what was requested vs enforced. RLIMIT_AS
+    overuse raises MemoryError inside the offending task (session
+    survives); RLIMIT_CPU overuse kills the process (client respawns).
+    CPU accounting is process-lifetime cumulative, not per task.
+    """
+    info = {
+        "mem_limit_mb": MAX_MEM_MB,
+        "mem_enforced": False,
+        "cpu_limit_s": MAX_CPU_S,
+        "cpu_enforced": False,
+        "reason": None,
+    }
+    try:
+        import resource as _resource
+    except ImportError:
+        info["reason"] = "resource module unavailable (non-Unix)"
+        return info
+    reasons = []
+    if MAX_MEM_MB > 0:
+        cap = MAX_MEM_MB * 1024 * 1024
+        current_vsz = _current_vsz_bytes()
+        if current_vsz is not None and cap < current_vsz:
+            reasons.append(
+                f"cap {MAX_MEM_MB}MB below current address space ({current_vsz // 1048576}MB); not enforced"
+            )
+        else:
+            try:
+                _resource.setrlimit(_resource.RLIMIT_AS, (cap, cap))
+                info["mem_enforced"] = True
+            except Exception as exc:
+                reasons.append(f"RLIMIT_AS refused: {exc}")
+    if MAX_CPU_S > 0:
+        try:
+            _resource.setrlimit(_resource.RLIMIT_CPU, (MAX_CPU_S, MAX_CPU_S))
+            info["cpu_enforced"] = True
+        except Exception as exc:
+            reasons.append(f"RLIMIT_CPU refused: {exc}")
+    if reasons:
+        info["reason"] = "; ".join(reasons)
+    return info
 
 
 def _respond(payload):
@@ -174,6 +298,15 @@ class Task:
         self.thread = None
         self.started = time.monotonic()
         self.ended = None
+        # Baselines are process-wide so the creating thread does not matter,
+        # except cpu_start which the worker records itself (thread_time is
+        # per-thread).
+        self.cpu_start = None
+        self.cpu_ms = None
+        self.peak_start = _peak_rss_bytes()
+        self.tm_start = None
+        self.peak_growth_bytes = None
+        self.vars = None
         # Guards status/thread-identity checks so interrupt() can never
         # inject into a recycled thread. The worker sets its terminal status
         # under this lock before exiting; interrupt() only injects while the
@@ -195,6 +328,12 @@ class ReplServer:
         self.task_order = collections.deque()
         self.lock = threading.Lock()
         self.inbox: queue.Queue = queue.Queue()
+        self.limits = _apply_limits()
+        # Spawn generation: _wait_for pumps the inbox, so a second execute
+        # can dispatch nested while the outer one is still waiting. Every
+        # spawn bumps this; an execute that waited (preempt) must re-check
+        # it before spawning, otherwise two workers would run at once.
+        self._spawn_epoch = 0
         # Orphan sink: late output from user-spawned background threads lands
         # here instead of the protocol stream. sys.stdout/sys.stderr always
         # point at these writers when no task is running; protocol responses
@@ -231,6 +370,17 @@ class ReplServer:
         out = StreamWriter(task.buffer, "stdout")
         err = StreamWriter(task.buffer, "stderr")
         sys.stdout, sys.stderr = out, err
+        if _CPU_CLOCK is not None:
+            try:
+                task.cpu_start = _CPU_CLOCK()
+            except Exception:
+                task.cpu_start = None
+        if _USE_TRACEMALLOC_PEAK:
+            try:
+                _tracemalloc.reset_peak()
+                task.tm_start = _tracemalloc.get_traced_memory()[0]
+            except Exception:
+                task.tm_start = None
         try:
             try:
                 node = ast.parse(task.code, mode="exec")
@@ -289,6 +439,7 @@ class ReplServer:
                     )
                     task.result_store_truncated = True
             finally:
+                self._finalize_metrics(task)
                 # An interrupt landing inside this cleanup must not leave the
                 # task stuck: never report running once the thread is gone.
                 with task.lock:
@@ -297,6 +448,48 @@ class ReplServer:
                         if task.ended is None:
                             task.ended = time.monotonic()
                 task.done.set()
+
+    def _finalize_metrics(self, task):
+        """Snapshot per-task cpu/peak-rss/namespace size. Never raises."""
+        try:
+            if task.cpu_start is not None and _CPU_CLOCK is not None:
+                task.cpu_ms = int((_CPU_CLOCK() - task.cpu_start) * 1000)
+        except Exception:
+            task.cpu_ms = None
+        try:
+            if _USE_TRACEMALLOC_PEAK and task.tm_start is not None:
+                task.peak_growth_bytes = _tracemalloc.get_traced_memory()[1] - task.tm_start
+            elif task.peak_start is not None:
+                peak_end = _peak_rss_bytes()
+                if peak_end is not None:
+                    task.peak_growth_bytes = peak_end - task.peak_start
+        except Exception:
+            task.peak_growth_bytes = None
+        try:
+            task.vars = len(self.namespace)
+        except Exception:
+            task.vars = None
+
+    def _proc_snapshot(self):
+        """Process-wide counters for the status view. Never raises."""
+        snap = {"vars": len(self.namespace)}
+        try:
+            if _CPU_CLOCK is not None and hasattr(time, "process_time"):
+                snap["cpu_total_ms"] = int(time.process_time() * 1000)
+        except Exception:
+            pass
+        current = _current_rss_bytes()
+        if current is not None:
+            snap["rss_bytes"] = current
+        peak = _peak_rss_bytes()
+        if peak is not None:
+            snap["peak_rss_bytes"] = peak
+        elif _USE_TRACEMALLOC_PEAK:
+            try:
+                snap["rss_bytes"] = _tracemalloc.get_traced_memory()[0]
+            except Exception:
+                pass
+        return snap
 
     def _reader_loop(self):
         # A dedicated thread owns the blocking stdin read, so the main thread
@@ -380,14 +573,49 @@ class ReplServer:
         code = req.get("code", "")
         task_id = req.get("task_id") or f"t_{self.exec_count + 1}"
         wait_ms = req.get("wait_ms", 30000)
+        preempt = bool(req.get("preempt", False))
+        entry_epoch = self._spawn_epoch
+        preempted = None
         running = self._running_task()
         if running is not None:
+            if not preempt:
+                return {
+                    "status": "busy",
+                    "task_id": running.task_id,
+                    "message": "another task is running; read or interrupt it first",
+                }
+            err = self._inject_interrupt(running)
+            if err is not None and err != "already finished":
+                return {
+                    "status": "preempt_failed",
+                    "task_id": running.task_id,
+                    "message": f"could not interrupt task {running.task_id}: {err}; re-init to respawn",
+                }
+            try:
+                self._wait_for(running, INTERRUPT_WAIT_S)
+            except SystemExit:
+                self._answer_inflight(req, running)
+                raise
+            with running.lock:
+                still_running = running.status == "running"
+            if still_running:
+                return {
+                    "status": "preempt_failed",
+                    "task_id": running.task_id,
+                    "message": f"task {running.task_id} ignored the interrupt (native blocking call?); re-init to respawn",
+                }
+            preempted = {"task_id": running.task_id, "status": running.status}
+        if self._spawn_epoch != entry_epoch:
+            # A nested execute spawned while this one waited (preempt race
+            # or recycled-id arrival): back off so only one worker runs.
+            current = self._running_task()
             return {
                 "status": "busy",
-                "task_id": running.task_id,
-                "message": "another task is running; read or interrupt it first",
+                "task_id": current.task_id if current is not None else task_id,
+                "message": "another execute spawned while this one waited; retry",
             }
         self.exec_count += 1
+        self._spawn_epoch += 1
         task = Task(task_id, code, self.exec_count)
         self._register(task)
         thread = threading.Thread(target=self._run_task, args=(task,), daemon=True)
@@ -399,13 +627,19 @@ class ReplServer:
             self._answer_inflight(req, task)
             raise
         if finished:
-            return self._task_payload(task, include_lines=True)
-        return {
+            payload = self._task_payload(task, include_lines=True)
+            if preempted is not None:
+                payload["preempted"] = preempted
+            return payload
+        payload = {
             "status": "running",
             "task_id": task.task_id,
             "n": task.n,
             "message": "still running; use read to poll or interrupt to stop",
         }
+        if preempted is not None:
+            payload["preempted"] = preempted
+        return payload
 
     @staticmethod
     def _preview_result(result):
@@ -434,7 +668,19 @@ class ReplServer:
             "elapsed_ms": int((ended - task.started) * 1000),
             "output_bytes": task.buffer.total_bytes,
             "output_lines": task.buffer.total_lines,
+            "mem_limit_mb": self.limits["mem_limit_mb"],
         }
+        if task.cpu_ms is not None:
+            payload["cpu_ms"] = task.cpu_ms
+        if task.peak_growth_bytes is not None:
+            payload["peak_growth_bytes"] = task.peak_growth_bytes
+        if task.vars is not None:
+            payload["vars"] = task.vars
+        elif task.status == "running":
+            try:
+                payload["vars"] = len(self.namespace)
+            except Exception:
+                pass
         if task.has_result:
             preview, cut = self._preview_result(task.result)
             payload["result_preview"] = preview
@@ -501,38 +747,45 @@ class ReplServer:
             payload["orphan_truncated_lines"] = dropped
         return payload
 
+    def _inject_interrupt(self, task):
+        """Deliver KeyboardInterrupt to a running task thread.
+
+        Returns None when the injection was delivered, else an error
+        string ("already finished" means the task ended on its own).
+        """
+        with task.lock:
+            if task.status != "running" or task.thread is None or not task.thread.is_alive():
+                return "already finished"
+            tid = task.thread.ident
+            if tid is None:
+                return "task thread has no ident yet"
+            try:
+                # c_ulong matches CPython's unsigned long thread id on
+                # 64-bit Linux/macOS; guarded below for other platforms.
+                # CPython-only: other interpreters lack pythonapi.
+                res = ctypes.pythonapi.PyThreadState_SetAsyncExc(
+                    ctypes.c_ulong(tid), ctypes.py_object(KeyboardInterrupt)
+                )
+            except (AttributeError, ctypes.ArgumentError, OverflowError, TypeError) as exc:
+                return f"interrupt failed: {exc}"
+            if res == 0:
+                return "invalid thread id"
+            if res > 1:
+                ctypes.pythonapi.PyThreadState_SetAsyncExc(ctypes.c_ulong(tid), None)
+                return "failed to deliver interrupt to one thread"
+            return None
+
     def handle_interrupt(self, req):
         task = self._get_task(req.get("task_id", ""))
         if task is None:
             return {"status": "not_found", "message": "unknown task_id"}
-        with task.lock:
-            if task.status != "running" or task.thread is None or not task.thread.is_alive():
-                finished = True
-            else:
-                finished = False
-                tid = task.thread.ident
-                if tid is None:
-                    return {"status": "error", "message": "task thread has no ident yet"}
-                try:
-                    # c_ulong matches CPython's unsigned long thread id on
-                    # 64-bit Linux/macOS; guarded below for other platforms.
-                    res = ctypes.pythonapi.PyThreadState_SetAsyncExc(
-                        ctypes.c_ulong(tid), ctypes.py_object(KeyboardInterrupt)
-                    )
-                except (ctypes.ArgumentError, OverflowError, TypeError) as exc:
-                    return {"status": "error", "message": f"interrupt failed: {exc}"}
-                if res == 0:
-                    return {"status": "error", "message": "invalid thread id"}
-                if res > 1:
-                    ctypes.pythonapi.PyThreadState_SetAsyncExc(ctypes.c_ulong(tid), None)
-                    return {
-                        "status": "error",
-                        "message": "failed to deliver interrupt to one thread",
-                    }
-        if finished:
+        err = self._inject_interrupt(task)
+        if err == "already finished":
             payload = self._task_payload(task, include_lines=True)
             payload["message"] = "task already finished"
             return payload
+        if err is not None:
+            return {"status": "error", "message": err}
         try:
             self._wait_for(task, INTERRUPT_WAIT_S)
         except SystemExit:
@@ -563,7 +816,13 @@ class ReplServer:
         req_id = req.get("id")
         try:
             if op == "ping":
-                body = {"status": "ok", "version": VERSION, "python": sys.version}
+                body = {
+                    "status": "ok",
+                    "version": VERSION,
+                    "python": sys.version,
+                    "limits": self.limits,
+                    "proc": self._proc_snapshot(),
+                }
             elif op == "execute":
                 body = self.handle_execute(req)
             elif op == "read":
@@ -574,17 +833,30 @@ class ReplServer:
                 body = self.handle_reset()
             elif op == "list":
                 with self.lock:
+                    entries = []
+                    for tid in self.task_order:
+                        task = self.tasks.get(tid)
+                        if task is None:
+                            continue
+                        entry = {
+                            "task_id": tid,
+                            "n": task.n,
+                            "task_status": task.status,
+                            "elapsed_ms": int(
+                                ((task.ended if task.ended is not None else time.monotonic()) - task.started)
+                                * 1000
+                            ),
+                            "output_lines": task.buffer.total_lines,
+                            "output_bytes": task.buffer.total_bytes,
+                        }
+                        if task.error is not None:
+                            entry["error_type"] = task.error.get("type")
+                        entries.append(entry)
                     body = {
                         "status": "ok",
-                        "tasks": [
-                            {
-                                "task_id": tid,
-                                "n": self.tasks[tid].n,
-                                "task_status": self.tasks[tid].status,
-                            }
-                            for tid in self.task_order
-                            if tid in self.tasks
-                        ],
+                        "tasks": entries,
+                        "proc": self._proc_snapshot(),
+                        "limits": self.limits,
                     }
             elif op == "shutdown":
                 body = {"status": "ok"}
