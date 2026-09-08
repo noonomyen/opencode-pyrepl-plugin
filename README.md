@@ -34,17 +34,19 @@ Env knobs (all optional): `PYREPL_PYTHON`, `PYREPL_TIMEOUT_S`,
 `PYREPL_MAX_BYTES`, `PYREPL_MAX_LINE_CHARS`, `PYREPL_MAX_GREP_CHARS`,
 `PYREPL_RESULT_MAX_CHARS`, `PYREPL_RESULT_MAX_STORE`, `PYREPL_RECENT_TASKS`,
 `PYREPL_INTERRUPT_WAIT_S`, `PYREPL_NOTIFY_AGENT`, `PYREPL_NOTIFY_POLL_MS`,
-`PYREPL_MAX_MEM_MB` (default 4096, 0 = off), `PYREPL_MAX_CPU_S` (default 0 = off).
+`PYREPL_NOTIFY_PROGRESS_S` (default 0 = off),
+`PYREPL_MAX_MEM_MB` (default 4096, 0 = off), `PYREPL_MAX_CPU_S` (default 0 = off),
+`PYREPL_MAX_NPROC` (default 0 = off), `PYREPL_MEM_WARN_PCT` (default 80, 0 = off).
 
 ## Tools
 
 | Tool | Purpose |
 | ---- | ------- |
 | `pyrepl_init` | Pick an interpreter (`bin_path`, else `PYREPL_PYTHON`, `.venv`, `python3`). Optional; `exec` auto-initializes. |
-| `pyrepl_exec` | Run code. `reset: true` wipes state and runs in one step. `preempt: true` interrupts the running task first, then runs. Long runs return a `task_id` instead of blocking. |
+| `pyrepl_exec` | Run code. `reset: true` wipes state and runs in one step. `preempt: true` interrupts the running task first, then runs. `progress_s` sends interim still-running notices. Long runs return a `task_id` instead of blocking. |
 | `pyrepl_read` | Poll a running task or page truncated output (`offset`/`limit`, `grep`, `tail_lines`, targets `stdout/stderr/combined/result/orphan`). |
-| `pyrepl_status` | Show session state: interpreter, exec count, resource limits, process counters, running task and recent tasks. |
-| `pyrepl_interrupt` | Stop a running task, keep the session. |
+| `pyrepl_status` | Show live session state (`task_id` drills into one task; `limit`/`filter` opt into task history, otherwise live info only). |
+| `pyrepl_interrupt` | Stop a running task (`wait_s` bounds the wait), keep the session. |
 
 The first `exec` of a session notes it is fresh (state is new and dies with
 opencode). Timeouts never kill: the task keeps running until read or
@@ -67,13 +69,19 @@ newline-delimited JSON (`ping`, `execute`, `read`, `list`, `interrupt`,
 - Resource caps (Unix only, reported as unenforced elsewhere):
   `PYREPL_MAX_MEM_MB` via `RLIMIT_AS` (overuse raises `MemoryError` in the
   task, the session survives), `PYREPL_MAX_CPU_S` via `RLIMIT_CPU`
-  (overuse kills the server; the next call respawns fresh). CPU accounting
-  is process-lifetime cumulative, not per task.
+  (overuse kills the server; the next call respawns fresh), `PYREPL_MAX_NPROC`
+  via `RLIMIT_NPROC` (UID-wide anti fork-bomb, off by default; a cap below
+  ambient usage is refused with a reason instead of breaking boot).
+  CPU accounting is process-lifetime cumulative, not per task.
+  Past `PYREPL_MEM_WARN_PCT` (default 80%) of the mem cap the task output
+  carries a `[warn: ...]` line; warn-only, never kills.
 - Every task output ends with a machine-readable resource line
-  (`[resources: wall=..ms cpu=..ms peak=+..MB/4096MB vars=..]`); fields are
-  omitted where the platform cannot measure them.
+  (`[resources: wall=..ms cpu=..ms alloc=+.. peak=+..MB/4096MB vars=..]`);
+  `alloc` is net Python bytes (negative = freed, misses native allocs),
+  fields are omitted where the platform cannot measure them.
 - No magics, no inline plots (`Agg` + save-to-file), no `input()`/`pdb`.
-- `interrupt` stops Python-level loops instantly; stuck native calls
+- `interrupt` injects a private `_TaskKill` exception (escapes
+  `except KeyboardInterrupt`, unlike SIGINT); stuck native calls
   (e.g. `time.sleep`) need a respawn.
 
 ## Development

@@ -7,11 +7,11 @@ import path from "node:path"
 import { spawn, type ChildProcess } from "node:child_process"
 import type { Readable, Writable } from "node:stream"
 
-function envInt(name: string, fallback: number): number {
+function envInt(name: string, fallback: number, minimum = 1): number {
   const raw = process.env[name]?.trim()
   if (!raw) return fallback
   const n = Number(raw)
-  return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback
+  return Number.isFinite(n) && n >= minimum ? Math.floor(n) : fallback
 }
 
 const SERVER_FILE = fileURLToPath(new URL("./pyrepl_server.py", import.meta.url))
@@ -25,6 +25,9 @@ const RPC_TIMEOUT_MS = envInt("PYREPL_RPC_TIMEOUT_MS", 15000)
 // so it wakes up on its own instead of relying on manual pyrepl_read polls.
 const NOTIFY_AGENT = (process.env.PYREPL_NOTIFY_AGENT ?? "1").trim() !== "0"
 const NOTIFY_POLL_MS = envInt("PYREPL_NOTIFY_POLL_MS", 5000)
+// Interim progress cadence for long tasks (seconds, 0 = off). Per-exec
+// progress_s overrides it; interim notices never dump output.
+const NOTIFY_PROGRESS_S = envInt("PYREPL_NOTIFY_PROGRESS_S", 0, 0)
 
 // Shared guidance appended to every tool description: the plugin has no
 // plugin-level description field, so cross-tool rules ride on each tool.
@@ -32,7 +35,7 @@ const NOTIFY_POLL_MS = envInt("PYREPL_NOTIFY_POLL_MS", 5000)
 const GUIDE =
   " Single-flight: never call exec/init/reset in parallel;" +
   " a second exec returns busy (read or interrupt the running task, then retry, or exec with preempt=true);" +
-  " init with a new bin kills the running task." +
+  " init with a different bin kills the running task." +
   " Prefer define-once/call-many, print sparingly, set timeout_s per attempt, reset when switching problems."
 
 type RpcPending = {
@@ -60,9 +63,11 @@ type TaskResponse = {
   done?: boolean
   elapsed_ms?: number
   cpu_ms?: number
+  alloc_bytes?: number
   peak_growth_bytes?: number
   vars?: number
   mem_limit_mb?: number
+  mem_warn?: string
   preempted?: { task_id: string; status: string }
   output_bytes?: number
   output_lines?: number
@@ -101,6 +106,8 @@ type ServerLimits = {
   mem_enforced: boolean
   cpu_limit_s: number
   cpu_enforced: boolean
+  nproc_limit: number
+  nproc_enforced: boolean
   reason?: string | null
 }
 
@@ -478,6 +485,12 @@ function formatLimitNote(limits: ServerLimits | null): string | null {
   return parts.length > 0 ? parts.join(" ") : null
 }
 
+// Millis with sub-ms precision (server sends floats); integers stay bare.
+function fmtMs(ms: number | undefined): string {
+  if (ms === undefined || !Number.isFinite(ms)) return "?"
+  return `${Number.isInteger(ms) ? ms : ms.toFixed(1)}ms`
+}
+
 // Unsigned magnitude; callers add their own sign when needed.
 function fmtSize(bytes: number): string {
   const abs = Math.abs(bytes)
@@ -490,8 +503,12 @@ function fmtSize(bytes: number): string {
 // Single machine-readable resource line appended to every task output.
 // Always present; fields omitted when the platform cannot measure them.
 function formatResources(res: TaskResponse): string {
-  const parts: string[] = [`wall=${res.elapsed_ms ?? "?"}ms`]
-  if (res.cpu_ms !== undefined) parts.push(`cpu=${res.cpu_ms}ms`)
+  const parts: string[] = [`wall=${fmtMs(res.elapsed_ms)}`]
+  if (res.cpu_ms !== undefined) parts.push(`cpu=${fmtMs(res.cpu_ms)}`)
+  if (res.alloc_bytes !== undefined) {
+    const a = res.alloc_bytes
+    parts.push(`alloc=${a < 0 ? "-" : a > 0 ? "+" : ""}${fmtSize(a)}`)
+  }
   if (res.peak_growth_bytes !== undefined) {
     const growth = res.peak_growth_bytes
     const sign = growth < 0 ? "-" : growth > 0 ? "+" : ""
@@ -501,6 +518,10 @@ function formatResources(res: TaskResponse): string {
   }
   if (res.vars !== undefined) parts.push(`vars=${res.vars}`)
   return `[resources: ${parts.join(" ")}]`
+}
+
+function formatWarn(res: TaskResponse): string[] {
+  return res.mem_warn ? [`[warn: ${res.mem_warn}]`] : []
 }
 
 function formatLines(
@@ -610,6 +631,7 @@ function formatExecResult(res: TaskResponse, session: Session, freshNote: string
     ...formatErrorLines(res, true),
     ...formatDropNotes(res, false),
     ...formatOrphanHint(res, "read with"),
+    ...formatWarn(res),
     formatResources(res),
   )
   // formatResources always appends one line, so emptiness is measured
@@ -645,6 +667,7 @@ async function pushText(
   taskId: string,
   agent: string | undefined,
   text: string,
+  markNotified = true,
 ): Promise<boolean> {
   try {
     await client.session.promptAsync({
@@ -654,7 +677,7 @@ async function pushText(
         ...(agent ? { agent } : {}),
       },
     })
-    sessions.get(key)?.notified.add(taskId)
+    if (markNotified) sessions.get(key)?.notified.add(taskId)
     return true
   } catch {
     let set = pendingNotify.get(key)
@@ -701,6 +724,9 @@ async function deliverCompletion(
       return
     }
     if (res?.status === "error") return
+    // A parked entry resolved while the task still runs (e.g. a failed
+    // interim notice): the active waiter owns completion, drop the park.
+    if (!isTerminalTaskStatus(res.status)) return
     await pushText(client, key, taskId, agent, formatCompletionNotice(taskId, res))
   } catch {
     let set = pendingNotify.get(key)
@@ -712,6 +738,14 @@ async function deliverCompletion(
   }
 }
 
+function formatProgressNotice(taskId: string, t: TaskListEntry): string {
+  return (
+    `[pyrepl: task ${taskId} still running: wall=${fmtMs(t.elapsed_ms)} ` +
+    `out=${t.output_lines ?? 0}lines/${fmtSize(t.output_bytes ?? 0)}. ` +
+    `pyrepl_read task_id=${taskId} tail_lines=20 for latest.]`
+  )
+}
+
 // Fire-and-forget waiter armed when exec returns a running task. Exits
 // silently when the output already reached the agent another way, or when
 // the session was replaced/reset under it (generation guard: never watch
@@ -721,9 +755,12 @@ async function notifyWhenDone(
   key: string,
   taskId: string,
   agent: string | undefined,
+  progressS = 0,
 ): Promise<void> {
   const armed = sessions.get(key)
   const armedSeq = armed?.resetSeq ?? -1
+  const cadence = Number.isFinite(progressS) && progressS > 0 ? progressS : 0
+  let nextProgress = cadence > 0 ? Date.now() + cadence * 1000 : 0
   try {
     for (;;) {
       await new Promise((res) => setTimeout(res, NOTIFY_POLL_MS))
@@ -742,6 +779,11 @@ async function notifyWhenDone(
         return
       }
       if (!found || isTerminalTaskStatus(found.task_status)) break
+      if (nextProgress > 0 && Date.now() >= nextProgress) {
+        nextProgress += cadence * 1000
+        // Interim notice: never marks notified, completion still fires.
+        await pushText(client, key, taskId, agent, formatProgressNotice(taskId, found), false)
+      }
     }
     await deliverCompletion(client, key, taskId, agent)
   } catch {
@@ -757,7 +799,7 @@ async function flushPendingNotify(client: NotifyClient, key: string): Promise<vo
 }
 
 function formatTaskLine(t: TaskListEntry, dash: boolean): string {
-  const parts = [`${t.task_id}: ${t.task_status}`, `wall=${t.elapsed_ms ?? "?"}ms`]
+  const parts = [`${t.task_id}: ${t.task_status}`, `wall=${fmtMs(t.elapsed_ms)}`]
   if ((t.output_lines ?? 0) > 0 || t.task_status === "running") {
     parts.push(`out=${t.output_lines ?? 0}lines/${fmtSize(t.output_bytes ?? 0)}`)
   }
@@ -769,7 +811,11 @@ function formatLimitsLine(limits: ServerLimits | null | undefined): string[] {
   if (!limits) return []
   const mem = formatCap("mem", "MB", limits.mem_limit_mb, limits.mem_enforced, limits.reason) ?? "mem=unlimited"
   const cpu = formatCap("cpu", "s", limits.cpu_limit_s, limits.cpu_enforced, limits.reason) ?? "cpu=unlimited"
-  return [`limits: ${mem} ${cpu}`]
+  const nproc =
+    (limits.nproc_limit ?? 0) > 0
+      ? ` ${formatCap("nproc", "", limits.nproc_limit, limits.nproc_enforced ?? false, limits.reason) ?? ""}`
+      : ""
+  return [`limits: ${mem} ${cpu}${nproc}`]
 }
 
 function formatProcLine(proc: ProcSnapshot | null | undefined): string[] {
@@ -777,8 +823,15 @@ function formatProcLine(proc: ProcSnapshot | null | undefined): string[] {
   const parts: string[] = []
   if (proc.rss_bytes !== undefined) parts.push(`rss=${fmtSize(proc.rss_bytes)}`)
   if (proc.peak_rss_bytes !== undefined) parts.push(`peak=${fmtSize(proc.peak_rss_bytes)}`)
-  if (proc.cpu_total_ms !== undefined) parts.push(`cpu_total=${proc.cpu_total_ms}ms`)
+  if (proc.cpu_total_ms !== undefined) parts.push(`cpu_total=${fmtMs(proc.cpu_total_ms)}`)
   return parts.length > 0 ? [`proc: ${parts.join(" ")}`] : []
+}
+
+// Clamp user seconds into a sane range so a NaN/Inf/negative can never
+// wedge an RPC wait on either side of the protocol.
+function clampWaitS(v: number | undefined): number {
+  if (!Number.isFinite(v ?? NaN)) return 5
+  return Math.min(300, Math.max(1, Math.floor(v as number)))
 }
 
 export const PyReplPlugin: Plugin = async (ctx) => {
@@ -807,7 +860,7 @@ export const PyReplPlugin: Plugin = async (ctx) => {
     tool: {
       pyrepl_init: tool({
         description:
-          "Initialize the persistent Python REPL for this session with a chosen interpreter. Optional; pyrepl_exec auto-initializes with auto-detected python if you skip this. Use when you need a specific venv or global python (like VSCode interpreter picker)." +
+          "Initialize the persistent Python REPL for this session with a chosen interpreter. Optional; pyrepl_exec auto-initializes with auto-detected python if you skip this. Use when you need a specific venv or global python (like VSCode interpreter picker). WARNING: init with a different interpreter kills any running task immediately and all state is lost." +
           GUIDE,
         args: {
           bin_path: tool.schema
@@ -846,6 +899,10 @@ export const PyReplPlugin: Plugin = async (ctx) => {
             .boolean()
             .optional()
             .describe("If true and another task is running, interrupt it first and run this code right after. Fails as preempt_failed when the running task ignores the interrupt (native blocking call); re-init to respawn then."),
+          progress_s: tool.schema
+            .number()
+            .optional()
+            .describe("Interim still-running notice cadence in seconds for this task (default off). The completion notice still fires separately; notices never dump output."),
         },
         async execute(args, context: ToolContext) {
           context.metadata({ title: "pyrepl exec" })
@@ -912,7 +969,8 @@ export const PyReplPlugin: Plugin = async (ctx) => {
             // not have to poll. The waiter exits silently if the output
             // reaches the agent first via pyrepl_read/pyrepl_interrupt.
             if (res?.preempted) session.consumed.add(res.preempted.task_id)
-            if (canNotify) void notifyWhenDone(client, key, res.task_id, context.agent || undefined)
+            const progressS = args.progress_s ?? NOTIFY_PROGRESS_S
+            if (canNotify) void notifyWhenDone(client, key, res.task_id, context.agent || undefined, progressS)
             const out = formatExecResult(res, session, freshNote)
             return canNotify
               ? `${out}\n[pyrepl: I will notify you in this session when task ${res.task_id} finishes; polling with pyrepl_read is optional]`
@@ -971,6 +1029,7 @@ export const PyReplPlugin: Plugin = async (ctx) => {
           else if (res.status === "running") out.push("(no output yet)")
           out.push(...formatDropNotes(res, true))
           out.push(...formatOrphanHint(res, "re-read with"))
+          out.push(...formatWarn(res))
           out.push(formatResources(res))
           return out.join("\n")
         },
@@ -978,13 +1037,21 @@ export const PyReplPlugin: Plugin = async (ctx) => {
 
       pyrepl_status: tool({
         description:
-          "Show REPL session state without executing code: interpreter, exec count, resource limits, process counters, running task and recent tasks. Use to re-orient after compaction or when unsure what is running." +
+          "Show live REPL session state without executing code: interpreter, exec count, resource limits, process counters, running tasks. Task history needs limit or filter params, otherwise only live info is shown. Use to re-orient after compaction or when unsure what is running." +
           GUIDE,
         args: {
           task_id: tool.schema
             .string()
             .optional()
             .describe("Check one task only instead of the whole session."),
+          limit: tool.schema
+            .number()
+            .optional()
+            .describe("Show this many recent tasks (history). Omit for live info only."),
+          filter: tool.schema
+            .enum(["all", "running", "failed"])
+            .optional()
+            .describe("History filter: all, running only, or failed (error+interrupted). Implies limit=10 when limit is omitted."),
         },
         async execute(args, context: ToolContext) {
           context.metadata({ title: "pyrepl status" })
@@ -1012,11 +1079,23 @@ export const PyReplPlugin: Plugin = async (ctx) => {
           ]
           const running = tasks.filter((t) => t.task_status === "running")
           for (const t of running) out.push(`running: ${formatTaskLine(t, false)}`)
-          if (tasks.length === 0) {
-            out.push("no tasks yet")
+          // History is opt-in: without limit/filter the agent gets live
+          // info only, keeping bg-status checks cheap.
+  const wantHistory = args.limit !== undefined || args.filter !== undefined
+  if (!wantHistory) return out.join("\n")
+  const rawLimit = args.limit ?? 10
+  const n = Number.isFinite(rawLimit) ? Math.max(1, Math.floor(rawLimit)) : 10
+          let hist = tasks
+          if (args.filter === "running") hist = hist.filter((t) => t.task_status === "running")
+          else if (args.filter === "failed") {
+            hist = hist.filter((t) => t.task_status === "error" || t.task_status === "interrupted")
+          }
+          hist = hist.slice(-n)
+          if (hist.length === 0) {
+            out.push("no matching tasks")
           } else {
-            out.push("recent:")
-            for (const t of tasks) out.push(formatTaskLine(t, true))
+            out.push(`recent (last ${hist.length}):`)
+            for (const t of hist) out.push(formatTaskLine(t, true))
           }
           return out.join("\n")
         },
@@ -1024,18 +1103,22 @@ export const PyReplPlugin: Plugin = async (ctx) => {
 
       pyrepl_interrupt: tool({
         description:
-          "Interrupt a running REPL task (SIGINT equivalent). Returns partial output. The session survives; only that task stops. If a blocking native call ignores the interrupt, re-init via pyrepl_init with the same bin_path to respawn." +
+          "Interrupt a running REPL task by injecting an exception into its thread. Returns partial output. The session survives; only that task stops. Native blocking calls (sleep, solvers, locks) ignore it: re-init via pyrepl_init with the same bin_path to respawn." +
           GUIDE,
         args: {
           task_id: tool.schema.string().describe("Running task id from pyrepl_exec."),
+          wait_s: tool.schema
+            .number()
+            .optional()
+            .describe("Seconds to wait for the task to stop after injection (default 5). Longer for tasks with heavy cleanup."),
         },
         async execute(args, context: ToolContext) {
           context.metadata({ title: `pyrepl interrupt ${args.task_id}` })
           const session = sessions.get(context.sessionID)
           if (!session || session.dead) return `no REPL session active (task ${args.task_id} unknown)`
-          const res = await rpc(session, { op: "interrupt", task_id: args.task_id }, RPC_TIMEOUT_MS)
+          const res = await rpc(session, { op: "interrupt", task_id: args.task_id, wait_s: clampWaitS(args.wait_s) }, RPC_TIMEOUT_MS)
           if (res?.status === "not_found") return `unknown task ${args.task_id}`
-          if (res?.status === "error") return `interrupt error: ${res.message ?? "unknown"}`
+          if (res?.status === "error") return `interrupt error: ${res.message ?? "unknown"}; re-init via pyrepl_init with the same bin_path to respawn`
           // The agent is present and got the partial output inline; no
           // wake-up needed if the waiter has not fired yet.
           if (res?.task_id) session.consumed.add(res.task_id)
@@ -1049,6 +1132,7 @@ export const PyReplPlugin: Plugin = async (ctx) => {
             ),
           )
           out.push(...formatErrorLines(res, false))
+          out.push(...formatWarn(res))
           out.push(formatResources(res))
           return out.join("\n")
         },

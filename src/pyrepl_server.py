@@ -33,6 +33,7 @@ import collections
 import ctypes
 import io
 import json
+import math
 import os
 import queue
 import re
@@ -42,6 +43,17 @@ import time
 import traceback
 
 VERSION = "0.1.0"
+
+
+class _TaskKill(BaseException):
+    """Cooperative kill signal injected into a worker thread.
+
+    Deliberately NOT KeyboardInterrupt: user code routinely catches
+    KeyboardInterrupt (ignore-Ctrl+C loops) or swallows it via bare
+    except clauses, while almost nothing catches a private BaseException
+    subclass except bare except / except BaseException. finally blocks
+    still run, so cleanup is preserved.
+    """
 
 
 def _env_int(name, fallback, minimum=1):
@@ -62,6 +74,11 @@ RECENT_TASKS = _env_int("PYREPL_RECENT_TASKS", 20)
 INTERRUPT_WAIT_S = _env_int("PYREPL_INTERRUPT_WAIT_S", 5)
 MAX_MEM_MB = _env_int("PYREPL_MAX_MEM_MB", 4096, minimum=0)
 MAX_CPU_S = _env_int("PYREPL_MAX_CPU_S", 0, minimum=0)
+# Off by default: the cap is UID-wide (shared with every other process of
+# this user), so a blind default breaks boot on busy machines. Opt in with
+# headroom over ambient usage.
+MAX_NPROC = _env_int("PYREPL_MAX_NPROC", 0, minimum=0)
+MEM_WARN_PCT = _env_int("PYREPL_MEM_WARN_PCT", 80, minimum=0)
 
 
 def _cpu_clock():
@@ -103,11 +120,16 @@ except ImportError:  # non-Unix: no getrusage/setrlimit
 # Peak-RSS source: getrusage high-water on Unix, else tracemalloc peak
 # (Python objects only, misses native allocations like numpy).
 _USE_TRACEMALLOC_PEAK = _HAVE_TRACEMALLOC and not _HAVE_GETRUSAGE
-if _USE_TRACEMALLOC_PEAK:
+# Net Python-byte allocation per task (tracemalloc current delta, may be
+# negative when the task frees more than it allocates). Always on where
+# available: nframes=1 keeps only totals, no tracebacks.
+_USE_TRACEMALLOC_ALLOC = _HAVE_TRACEMALLOC
+if _HAVE_TRACEMALLOC:
     try:
-        _tracemalloc.start()
+        _tracemalloc.start(1)
     except Exception:
         _USE_TRACEMALLOC_PEAK = False
+        _USE_TRACEMALLOC_ALLOC = False
 
 
 def _peak_rss_bytes():
@@ -142,18 +164,21 @@ def _current_vsz_bytes():
 
 
 def _apply_limits():
-    """Enforce mem/cpu caps via setrlimit where the platform allows.
+    """Enforce mem/cpu/nproc caps via setrlimit where the platform allows.
 
     Returns a dict describing what was requested vs enforced. RLIMIT_AS
     overuse raises MemoryError inside the offending task (session
     survives); RLIMIT_CPU overuse kills the process (client respawns).
     CPU accounting is process-lifetime cumulative, not per task.
+    RLIMIT_NPROC caps UID-wide process count (anti fork-bomb, not CPU).
     """
     info = {
         "mem_limit_mb": MAX_MEM_MB,
         "mem_enforced": False,
         "cpu_limit_s": MAX_CPU_S,
         "cpu_enforced": False,
+        "nproc_limit": MAX_NPROC,
+        "nproc_enforced": False,
         "reason": None,
     }
     try:
@@ -181,9 +206,53 @@ def _apply_limits():
             info["cpu_enforced"] = True
         except Exception as exc:
             reasons.append(f"RLIMIT_CPU refused: {exc}")
+    if MAX_NPROC > 0:
+        # Soft limit only (hard stays untouched so this is reversible), then
+        # prove a thread can still spawn: on Linux NPROC counts threads too,
+        # and the quota is UID-wide, so a cap below ambient usage breaks
+        # boot. A failed probe restores the old soft limit.
+        old = None
+        try:
+            old_soft, old_hard = _resource.getrlimit(_resource.RLIMIT_NPROC)
+            old = (old_soft, old_hard)
+            effective = min(MAX_NPROC, old_hard)
+            _resource.setrlimit(_resource.RLIMIT_NPROC, (effective, old_hard))
+            probe = threading.Thread(target=lambda: None, daemon=True)
+            probe.start()
+            probe.join(timeout=5)
+            if probe.is_alive():
+                raise RuntimeError("probe thread did not finish")
+            info["nproc_limit"] = effective
+            info["nproc_enforced"] = True
+        except Exception as exc:
+            if old is not None:
+                try:
+                    _resource.setrlimit(_resource.RLIMIT_NPROC, (old[0], old[1]))
+                except Exception:
+                    pass
+            reasons.append(f"RLIMIT_NPROC {MAX_NPROC} unusable here ({exc}); not enforced")
     if reasons:
         info["reason"] = "; ".join(reasons)
     return info
+
+
+def _check_mem_warn(task):
+    """One-shot RSS warning for a running task. Warn-only, never kills."""
+    if task.mem_warned is not None or MEM_WARN_PCT <= 0:
+        return
+    if MAX_MEM_MB <= 0 or not _HAVE_GETRUSAGE:
+        return
+    try:
+        current = _peak_rss_bytes()
+        if current is None:
+            return
+        cap = MAX_MEM_MB * 1024 * 1024
+        if current > cap * MEM_WARN_PCT // 100:
+            task.mem_warned = (
+                f"RSS {current // 1048576}MB > {MEM_WARN_PCT}% of {MAX_MEM_MB}MB limit"
+            )
+    except Exception:
+        pass
 
 
 def _respond(payload):
@@ -305,7 +374,9 @@ class Task:
         self.cpu_ms = None
         self.peak_start = _peak_rss_bytes()
         self.tm_start = None
+        self.alloc_bytes = None
         self.peak_growth_bytes = None
+        self.mem_warned = None
         self.vars = None
         # Guards status/thread-identity checks so interrupt() can never
         # inject into a recycled thread. The worker sets its terminal status
@@ -375,7 +446,7 @@ class ReplServer:
                 task.cpu_start = _CPU_CLOCK()
             except Exception:
                 task.cpu_start = None
-        if _USE_TRACEMALLOC_PEAK:
+        if _USE_TRACEMALLOC_PEAK or _USE_TRACEMALLOC_ALLOC:
             try:
                 _tracemalloc.reset_peak()
                 task.tm_start = _tracemalloc.get_traced_memory()[0]
@@ -409,6 +480,14 @@ class ReplServer:
             else:
                 exec(compile(node, "<repl>", "exec"), self.namespace)  # executing code is this server's purpose
             task.finish("done")
+        except _TaskKill:
+            with task.lock:
+                task.error = {
+                    "type": "_TaskKill",
+                    "message": "task killed by pyrepl interrupt",
+                    "traceback": traceback.format_exc(),
+                }
+            task.finish("interrupted")
         except KeyboardInterrupt:
             with task.lock:
                 task.error = {
@@ -450,20 +529,25 @@ class ReplServer:
                 task.done.set()
 
     def _finalize_metrics(self, task):
-        """Snapshot per-task cpu/peak-rss/namespace size. Never raises."""
+        """Snapshot per-task cpu/alloc/peak-rss/namespace size. Never raises."""
         try:
             if task.cpu_start is not None and _CPU_CLOCK is not None:
-                task.cpu_ms = int((_CPU_CLOCK() - task.cpu_start) * 1000)
+                task.cpu_ms = round((_CPU_CLOCK() - task.cpu_start) * 1000, 1)
         except Exception:
             task.cpu_ms = None
         try:
-            if _USE_TRACEMALLOC_PEAK and task.tm_start is not None:
-                task.peak_growth_bytes = _tracemalloc.get_traced_memory()[1] - task.tm_start
-            elif task.peak_start is not None:
+            if task.tm_start is not None:
+                current, peak = _tracemalloc.get_traced_memory()
+                if _USE_TRACEMALLOC_ALLOC:
+                    task.alloc_bytes = current - task.tm_start
+                if _USE_TRACEMALLOC_PEAK:
+                    task.peak_growth_bytes = peak - task.tm_start
+            if task.peak_growth_bytes is None and task.peak_start is not None:
                 peak_end = _peak_rss_bytes()
                 if peak_end is not None:
                     task.peak_growth_bytes = peak_end - task.peak_start
         except Exception:
+            task.alloc_bytes = None
             task.peak_growth_bytes = None
         try:
             task.vars = len(self.namespace)
@@ -545,6 +629,7 @@ class ReplServer:
                 return False
             if task.done.wait(timeout=min(0.1, remaining)):
                 return True
+            _check_mem_warn(task)
             self._pump_pending()
 
     def _answer_inflight(self, req, task):
@@ -665,15 +750,19 @@ class ReplServer:
             "n": task.n,
             "truncated_lines": dropped,
             "done": task.status != "running",
-            "elapsed_ms": int((ended - task.started) * 1000),
+            "elapsed_ms": round((ended - task.started) * 1000, 1),
             "output_bytes": task.buffer.total_bytes,
             "output_lines": task.buffer.total_lines,
             "mem_limit_mb": self.limits["mem_limit_mb"],
         }
         if task.cpu_ms is not None:
             payload["cpu_ms"] = task.cpu_ms
+        if task.alloc_bytes is not None:
+            payload["alloc_bytes"] = task.alloc_bytes
         if task.peak_growth_bytes is not None:
             payload["peak_growth_bytes"] = task.peak_growth_bytes
+        if task.mem_warned is not None:
+            payload["mem_warn"] = task.mem_warned
         if task.vars is not None:
             payload["vars"] = task.vars
         elif task.status == "running":
@@ -748,7 +837,7 @@ class ReplServer:
         return payload
 
     def _inject_interrupt(self, task):
-        """Deliver KeyboardInterrupt to a running task thread.
+        """Deliver _TaskKill to a running task thread.
 
         Returns None when the injection was delivered, else an error
         string ("already finished" means the task ended on its own).
@@ -763,8 +852,11 @@ class ReplServer:
                 # c_ulong matches CPython's unsigned long thread id on
                 # 64-bit Linux/macOS; guarded below for other platforms.
                 # CPython-only: other interpreters lack pythonapi.
+                # 3.14+ only accepts a class here; an instance raises
+                # SystemError. The message is attached by the except
+                # _TaskKill handler instead.
                 res = ctypes.pythonapi.PyThreadState_SetAsyncExc(
-                    ctypes.c_ulong(tid), ctypes.py_object(KeyboardInterrupt)
+                    ctypes.c_ulong(tid), ctypes.py_object(_TaskKill)
                 )
             except (AttributeError, ctypes.ArgumentError, OverflowError, TypeError) as exc:
                 return f"interrupt failed: {exc}"
@@ -787,7 +879,15 @@ class ReplServer:
         if err is not None:
             return {"status": "error", "message": err}
         try:
-            self._wait_for(task, INTERRUPT_WAIT_S)
+            wait_s = req.get("wait_s", INTERRUPT_WAIT_S)
+            try:
+                wait_s = float(wait_s)
+                if not math.isfinite(wait_s):
+                    raise ValueError
+                wait_s = min(300, max(0, wait_s))
+            except (TypeError, ValueError):
+                wait_s = INTERRUPT_WAIT_S
+            self._wait_for(task, wait_s)
         except SystemExit:
             self._answer_inflight(req, task)
             raise
@@ -842,9 +942,10 @@ class ReplServer:
                             "task_id": tid,
                             "n": task.n,
                             "task_status": task.status,
-                            "elapsed_ms": int(
+                            "elapsed_ms": round(
                                 ((task.ended if task.ended is not None else time.monotonic()) - task.started)
-                                * 1000
+                                * 1000,
+                                1,
                             ),
                             "output_lines": task.buffer.total_lines,
                             "output_bytes": task.buffer.total_bytes,
