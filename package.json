@@ -11,6 +11,7 @@
   },
   "main": "./src/pyrepl.ts",
   "exports": {
+    ".": "./src/pyrepl.ts",
     "./server": "./src/pyrepl.ts",
     "./package.json": "./package.json"
   },
@@ -20,12 +21,16 @@
   ],
   "scripts": {
     "deploy": "bun src/install.ts",
+    "build": "bun src/build.ts",
+    "build:js": "bun src/build.ts --js-only",
+    "build:py": "bun src/build.ts --py-only",
     "typecheck": "tsc --noEmit",
     "lint": "ruff check src/",
     "test": "bun test tests/",
-    "test:fast": "bun test tests/protocol.test.ts tests/tools.test.ts",
+    "test:fast": "bun test tests/protocol.test.ts tests/tools.test.ts tests/config.test.ts",
     "test:slow": "bun test tests/slow.test.ts",
-    "ci": "bun run typecheck && bun run lint && bun test tests/"
+    "ci": "bun run typecheck && bun run lint && bun run build && bun test tests/",
+    "prepack": "find src tests -name __pycache__ -type d -prune -exec rm -rf {} +"
   },
   "peerDependencies": {
     "@opencode-ai/plugin": "^1.18.29"
@@ -33,7 +38,7 @@
   "devDependencies": {
     "@opencode-ai/plugin": "1.18.29",
     "@types/node": "26.2.0",
-    "typescript": "^7.0.2",
-    "zod": "4.1.8"
+    "bun-types": "^1.4.2",
+    "typescript": "^7.0.2"
   }
 }

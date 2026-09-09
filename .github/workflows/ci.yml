@@ -20,4 +20,5 @@ jobs:
       - run: bun install --frozen-lockfile
       - run: bun run typecheck
       - run: pipx run ruff check src/
+      - run: bun run build
       - run: bun test tests/

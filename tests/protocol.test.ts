@@ -500,7 +500,7 @@ test("deeply nested AST fails fast instead of hanging", async () => {
   const c = new ProcClient()
   try {
     const t0 = Date.now()
-    const r = await c.call({ op: "execute", task_id: "t_ast", wait_ms: 10000, code: "("*2000 + ")"*2000 }, 15000)
+    const r = await c.call({ op: "execute", task_id: "t_ast", wait_ms: 10000, code: "(".repeat(2000) + ")".repeat(2000) }, 15000)
     expect(r.status).toBe("error")
     expect(Date.now() - t0).toBeLessThan(10000)
     expect((await c.call({ op: "ping" }, 5000)).status).toBe("ok")

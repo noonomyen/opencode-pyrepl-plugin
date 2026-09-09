@@ -7,7 +7,8 @@
     "strict": true,
     "skipLibCheck": true,
     "noEmit": true,
-    "types": ["node"]
+    "allowImportingTsExtensions": true,
+    "types": ["node", "bun-types"]
   },
-  "include": ["src", ".opencode"]
+  "include": ["src", "tests", ".opencode"]
 }

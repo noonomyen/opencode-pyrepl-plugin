@@ -30,8 +30,8 @@ export class ProcClient {
   exited: Promise<number | null>
   private exitResolve!: (v: number | null) => void
 
-  constructor(env?: Record<string, string>) {
-    this.proc = spawn("python3", [SERVER_FILE], {
+  constructor(env?: Record<string, string>, argv?: string[]) {
+    this.proc = spawn("python3", argv ?? [SERVER_FILE], {
       stdio: ["pipe", "pipe", "pipe"],
       env: { ...process.env, ...(env ?? {}) },
     })
