@@ -11,7 +11,7 @@ import {
   formatWarn,
 } from "../format.ts"
 import { rpc } from "../rpc.ts"
-import { isTerminalTaskStatus, sessions } from "../session.ts"
+import { checkRunningTask, isTerminalTaskStatus, sessions } from "../session.ts"
 import { GUIDE, type ToolDeps } from "./common.ts"
 
 export function createReadTool(_deps: ToolDeps) {
@@ -35,15 +35,22 @@ export function createReadTool(_deps: ToolDeps) {
     async execute(args, context: ToolContext) {
       context.metadata({ title: `pyrepl read ${args.task_id}` })
       const session = sessions.get(context.sessionID)
-      if (!session || session.dead) return `no REPL session active (task ${args.task_id} unknown; sessions do not survive opencode restarts)`
+      const taskId = typeof args.task_id === "string" ? args.task_id.trim() : ""
+      if (!session || session.dead) return `no REPL session active (task ${taskId || "unknown"} unknown; sessions do not survive opencode restarts)`
       // Live-refresh TS-side knobs (preview/rpc budgets) like exec/init do;
       // engine-side knobs stay frozen at spawn by design.
       session.config = (await loadMergedConfig(context)).config
+      if (!taskId) {
+        const { runningId } = await checkRunningTask(session, session.config.rpc_timeout_ms)
+        return runningId
+          ? `task ${runningId} is still running; pass its task_id to pyrepl_read to poll it`
+          : `no task running`
+      }
       const res = await rpc(
         session,
         {
           op: "read",
-          task_id: args.task_id,
+          task_id: taskId,
           offset: args.offset ?? 0,
           limit: args.limit ?? 200,
           grep: args.grep ?? null,
@@ -52,7 +59,7 @@ export function createReadTool(_deps: ToolDeps) {
         },
         session.config.rpc_timeout_ms,
       )
-      if (res?.status === "not_found") return `unknown task ${args.task_id}`
+      if (res?.status === "not_found") return `unknown task ${taskId}`
       if (res?.status === "error") return `read error: ${res.message ?? "unknown"}`
       if (isTerminalTaskStatus(res?.status) && res?.task_id) session.consumed.add(res.task_id)
       const out: string[] = [`task ${res.task_id}: ${res.status}`]

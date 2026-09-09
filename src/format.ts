@@ -199,14 +199,6 @@ export function formatLostNotice(taskId: string): string {
   return `<pyrepl>\ntask ${taskId} lost: no longer on server (registry evicted or cleared). Output unavailable.\n<pyrepl>`
 }
 
-export function formatProgressNotice(taskId: string, t: TaskListEntry): string {
-  return (
-    `<pyrepl>\ntask ${taskId} still running: wall=${fmtMs(t.elapsed_ms)} ` +
-    `out=${t.output_lines ?? 0}lines/${fmtSize(t.output_bytes ?? 0)}. ` +
-    `pyrepl_read task_id=${taskId} tail_lines=20 for latest.\n<pyrepl>`
-  )
-}
-
 export function formatTaskLine(t: TaskListEntry, dash: boolean): string {
   const parts = [`${t.task_id}: ${t.task_status}`, `wall=${fmtMs(t.elapsed_ms)}`]
   if ((t.output_lines ?? 0) > 0 || t.task_status === "running") {

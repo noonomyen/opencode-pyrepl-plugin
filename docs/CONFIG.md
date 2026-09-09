@@ -21,10 +21,9 @@ bun src/install.ts --init-config
 | Key | Default | Description |
 | --- | ------- | ----------- |
 | `python` | `null` (auto) | Interpreter path. Auto means `.venv` in worktree/directory, then `python3`. |
-| `timeout_s` | `30` | Per-exec wait before `on_timeout` applies. |
+| `timeout_s` | `60` | Per-exec wait before `on_timeout` applies. |
 | `on_timeout` | `"interrupt"` | `interrupt` stops the task; `detach` leaves it running and notifies on completion. |
 | `notify_agent` | `true` | Notify you in-session when a background task finishes. `false` means poll manually. |
-| `notify_progress_s` | `0` | Still-running notice cadence. `0` = off. |
 | `preview_lines` / `preview_head` / `preview_tail` | `100` / `1000` / `2500` | Output preview size. |
 
 These apply immediately; no restart needed.
@@ -53,7 +52,7 @@ Advanced timing knobs (`wait_grace_ms`, `rpc_timeout_ms`,
 ```jsonc
 {
   "python": null,
-  "timeout_s": 30,
+  "timeout_s": 60,
   "on_timeout": "interrupt",
   "wait_grace_ms": 15000,
   "rpc_timeout_ms": 15000,
@@ -62,7 +61,6 @@ Advanced timing knobs (`wait_grace_ms`, `rpc_timeout_ms`,
   "preview_tail": 2500,
   "notify_agent": true,
   "notify_poll_ms": 5000,
-  "notify_progress_s": 0,
   "max_lines": 5000,
   "max_bytes": 1000000,
   "max_line_chars": 10000,

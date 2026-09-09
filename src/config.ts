@@ -25,7 +25,6 @@ export type ResolvedConfig = {
   preview_tail: number
   notify_agent: boolean
   notify_poll_ms: number
-  notify_progress_s: number
   on_timeout: "interrupt" | "detach"
   max_lines: number
   max_bytes: number
@@ -43,7 +42,7 @@ export type ResolvedConfig = {
 
 export const DEFAULT_CONFIG: ResolvedConfig = {
   python: null,
-  timeout_s: 30,
+  timeout_s: 60,
   wait_grace_ms: 15000,
   rpc_timeout_ms: 15000,
   preview_lines: 100,
@@ -51,7 +50,6 @@ export const DEFAULT_CONFIG: ResolvedConfig = {
   preview_tail: 2500,
   notify_agent: true,
   notify_poll_ms: 5000,
-  notify_progress_s: 0,
   on_timeout: "interrupt",
   max_lines: 5000,
   max_bytes: 1000000,
@@ -83,7 +81,6 @@ const FIELDS: Record<keyof ResolvedConfig, FieldSpec> = {
   preview_tail: { kind: "int", min: 1 },
   notify_agent: { kind: "bool" },
   notify_poll_ms: { kind: "int", min: 1 },
-  notify_progress_s: { kind: "int", min: 0 },
   on_timeout: { kind: "enum", values: ["interrupt", "detach"] },
   max_lines: { kind: "int", min: 1 },
   max_bytes: { kind: "int", min: 1 },
@@ -383,7 +380,7 @@ export const CONFIG_TEMPLATE = `{
   "python": null,
 
   // TS-side knobs.
-  "timeout_s": 30,          // per-exec synchronous wait
+  "timeout_s": 60,          // per-exec synchronous wait
   "on_timeout": "interrupt",// "interrupt" (stop it, return partial output) or "detach" (keep running, return task_id)
   "wait_grace_ms": 15000,   // extra RPC grace on top of timeout_s
   "rpc_timeout_ms": 15000,  // read/status/interrupt round-trip budget
@@ -392,7 +389,6 @@ export const CONFIG_TEMPLATE = `{
   "preview_tail": 2500,     // tail-heavy so END markers survive
   "notify_agent": true,     // wake the agent in-session when a background task finishes
   "notify_poll_ms": 5000,
-  "notify_progress_s": 0,   // interim still-running cadence, 0 = off
 
   // Engine knobs (applied at server boot).
   "max_lines": 5000,

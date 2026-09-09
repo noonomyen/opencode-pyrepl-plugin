@@ -20,7 +20,9 @@ Choose the Python interpreter. Optional; `exec` auto-detects when skipped.
 | `bin_path` | `python` in config, then `.venv`, then `python3` | e.g. `/usr/bin/python3` or `<proj>/.venv/bin/python` |
 
 Same interpreter keeps state. Switching wipes state and is refused while
-a task runs.
+a task runs. Different spellings of the same binary (symlink, bare name
+via PATH) count as the same interpreter; a venv python never counts as
+its base interpreter.
 
 ## pyrepl_exec
 
@@ -30,13 +32,15 @@ Run Python code.
 | ----- | ------- | ----------- |
 | `code` | required | Python source to run. |
 | `reset` | `false` | Clear all state first, then run as the first task. |
-| `timeout_s` | `30` | How long to wait before `on_timeout` applies. |
+| `timeout_s` | `60` | How long to wait before `on_timeout` applies. |
 | `on_timeout` | `"interrupt"` | `interrupt` stops the task with partial output; `detach` leaves it running and notifies you when done. |
 | `preempt` | `false` | Stop the running task first, then run this code. |
-| `progress_s` | off | Still-running notice every N seconds. |
 
 Long tasks return `task t_N`; poll with `pyrepl_read` or wait for the
-auto-notify.
+auto-notify. Printed output lives only while the task runs: once it
+finishes, lines are dropped and only the value (`Out[n]`, via
+`target=result`), error, and totals remain. Read a running task before
+it ends if you need its prints.
 
 ## pyrepl_read
 
@@ -49,6 +53,9 @@ Read a task's output or value.
 | `offset` / `limit` | `0` / `200` | Page through lines. |
 | `tail_lines` | off | Last N lines only. |
 | `grep` | off | Regex filter on lines. |
+
+Omitting `task_id` points at the running task when there is one, else
+answers `no task running`.
 
 ## pyrepl_status
 
@@ -85,6 +92,9 @@ Stop a running task. The session survives.
 | `task_id` | required | Running task id. |
 | `wait_s` | `5` | How long to wait for it to stop. |
 | `mode` | `"cooperative"` | `kill` restarts the whole server (wipes state); use only when cooperative reports the task still running. |
+
+Omitting `task_id` points at the running task when there is one, else
+answers `no task running`.
 
 ## Examples
 

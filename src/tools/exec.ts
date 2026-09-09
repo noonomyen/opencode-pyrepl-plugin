@@ -28,7 +28,7 @@ export function createExecTool(deps: ToolDeps) {
       timeout_s: tool.schema
         .number()
         .optional()
-        .describe("Seconds to wait synchronously (default 30). On expiry the task is interrupted unless on_timeout=detach."),
+        .describe("Seconds to wait synchronously (default 60). On expiry the task is interrupted unless on_timeout=detach."),
       on_timeout: tool.schema
         .enum(["interrupt", "detach"])
         .optional()
@@ -37,10 +37,6 @@ export function createExecTool(deps: ToolDeps) {
         .boolean()
         .optional()
         .describe("If true and another task is running, interrupt it first and run this code right after. Fails as preempt_failed when the running task ignores the interrupt (signal-immune); re-init to respawn then."),
-      progress_s: tool.schema
-        .number()
-        .optional()
-        .describe("Interim still-running notice cadence in seconds for this task (default off). The completion notice still fires separately; notices never dump output."),
     },
     async execute(args, context: ToolContext) {
       context.metadata({ title: "pyrepl exec" })
@@ -120,9 +116,8 @@ export function createExecTool(deps: ToolDeps) {
         // not have to poll. The waiter exits silently if the output
         // reaches the agent first via pyrepl_read/pyrepl_interrupt.
         if (res?.preempted) session.consumed.add(res.preempted.task_id)
-        const progressS = args.progress_s ?? session.config.notify_progress_s
         if (canNotify && deps.client) {
-          void notifyWhenDone(deps.client, key, res.task_id, context.agent || undefined, progressS)
+          void notifyWhenDone(deps.client, key, res.task_id, context.agent || undefined)
         }
         const out = formatExecResult(res, session, freshNote)
         return canNotify

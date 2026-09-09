@@ -74,6 +74,32 @@ ASYNC_DELAY_S = 0.2
 # (process-directed kill() could land anywhere). Absent on Windows, where
 # interrupt degrades to _TaskKill only.
 _HAVE_PTHREAD_KILL = hasattr(signal, "pthread_kill")
+# User code compiles under this filename (see _run_task), so engine frames
+# are recognizable and strippable from user-facing tracebacks.
+_USER_FILENAME = "<repl>"
+
+
+def _format_user_traceback(exc):
+    """Traceback with engine frames stripped (no local paths leak).
+
+    User code runs inside _run_task, so format_exc() would prefix every
+    error with File ".../server.py" frames. Keep only user frames;
+    exceptions raised before any user frame runs (e.g. SyntaxError at
+    parse time) fall back to the exception line alone. Never raises.
+    """
+    try:
+        entries = [e for e in traceback.extract_tb(exc.__traceback__) if e.filename == _USER_FILENAME]
+        if not entries:
+            return "".join(traceback.format_exception_only(type(exc), exc))
+        out = ["Traceback (most recent call last):\n"]
+        out.extend(traceback.format_list(entries))
+        out.extend(traceback.format_exception_only(type(exc), exc))
+        return "".join(out)
+    except Exception:
+        try:
+            return traceback.format_exc()
+        except Exception:
+            return f"{type(exc).__name__}: {exc}"
 
 
 class ReplServer:
@@ -169,7 +195,7 @@ class ReplServer:
                 task.error = {
                     "type": type(exc).__name__,
                     "message": str(exc),
-                    "traceback": traceback.format_exc(),
+                    "traceback": _format_user_traceback(exc),
                 }
                 task.finish(status)
                 return

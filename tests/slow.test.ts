@@ -1,4 +1,4 @@
-/** Slow timing-sensitive suites: notifications, progress, death, CPU kill,
+/** Slow timing-sensitive suites: notifications, death, CPU kill,
  * EOF races. Runs every PR (budget ~4 min). Run: bun test tests/slow.test.ts
  */
 import { test, expect, afterAll } from "bun:test"
@@ -11,7 +11,6 @@ const SLOW_SESSIONS = [
   "slow-sess-readfirst",
   "slow-sess-idleflush",
   "slow-sess-death",
-  "slow-sess-progress",
 ]
 
 afterAll(async () => {
@@ -150,26 +149,6 @@ test("server death mid-task notifies, next exec respawns fresh", async () => {
   expect(r).toContain("<pyrepl>")
   expect(r).toContain("Out[1]: 2")
 }, 45000)
-
-test("progress_s sends interim notices, completion still fires", async () => {
-  const prompts: any[] = []
-  const hooks: any = await loadPlugin({
-    client: { session: { promptAsync: async (o: any) => { prompts.push(o); return {} } } },
-  })
-  const ctx = fakeCtx("slow-sess-progress")
-  const r: string = await hooks.tool.pyrepl_exec.execute(
-    { code: "import time\ntime.sleep(7)\nprint('pg-done')", timeout_s: 1, on_timeout: "detach", progress_s: 2 }, ctx)
-  const m = r.match(/task (t_\d+)/)
-  const t0 = Date.now()
-  while (prompts.length < 2 && Date.now() - t0 < 25000) await sleep(500)
-  expect(prompts.length).toBeGreaterThanOrEqual(2)
-  const interim = prompts[0]?.body?.parts?.[0]?.text ?? ""
-  const last = prompts[prompts.length - 1]?.body?.parts?.[0]?.text ?? ""
-  expect(interim).toContain("still running")
-  expect(interim).not.toContain("pg-done")
-  expect(last).toContain("background task done")
-  expect(last).toContain(m![1])
-}, 35000)
 
 test("CPU cap kills runaway, server exits", async () => {
   const c = new ProcClient({ PYREPL_MAX_CPU_S: "1" })

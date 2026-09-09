@@ -1,5 +1,5 @@
 import type { ToolContext } from "@opencode-ai/plugin"
-import { access } from "node:fs/promises"
+import { access, realpath } from "node:fs/promises"
 import { constants } from "node:fs"
 import path from "node:path"
 import { spawn, type ChildProcess } from "node:child_process"
@@ -14,8 +14,8 @@ import {
   type ResolvedConfig,
 } from "./config.ts"
 import { formatLimitNote } from "./format.ts"
-import { killSession, spawnSession } from "./rpc.ts"
-import type { Session } from "./types.ts"
+import { killSession, rpc, spawnSession } from "./rpc.ts"
+import type { Session, TaskListResponse } from "./types.ts"
 
 export const sessions = new Map<string, Session>()
 // Background tasks whose wake-up prompt failed to admit (e.g. session
@@ -78,6 +78,59 @@ export async function resolveBin(
   return "python3"
 }
 
+// A venv python is a symlink to its base interpreter, so same-target must
+// not imply same-environment (different sys.prefix/site-packages): treat
+// venv binaries conservatively, by literal path only.
+async function isVenvBin(bin: string): Promise<boolean> {
+  const dir = path.dirname(bin)
+  for (const c of [path.join(dir, "..", "pyvenv.cfg"), path.join(dir, "pyvenv.cfg")]) {
+    try {
+      await access(c)
+      return true
+    } catch {
+    }
+  }
+  return false
+}
+
+async function canonicalBin(bin: string): Promise<{ real: string; venv: boolean } | null> {
+  let p = bin
+  if (!p.includes(path.sep)) {
+    // Bare name (e.g. "python3"): resolve through PATH first.
+    let found: string | null = null
+    for (const dir of (process.env.PATH ?? "").split(path.delimiter)) {
+      if (!dir) continue
+      const c = path.join(dir, bin)
+      if (await existsExecutable(c)) {
+        found = c
+        break
+      }
+      if (process.platform === "win32" && await existsExecutable(c + ".exe")) {
+        found = c + ".exe"
+        break
+      }
+    }
+    if (!found) return null
+    p = found
+  }
+  try {
+    return { real: await realpath(p), venv: await isVenvBin(p) }
+  } catch {
+    return null
+  }
+}
+
+// Same interpreter, tolerant of spelling: symlinks (/usr/bin/python3 vs
+// python3.14), /bin vs /usr/bin merges, bare names via PATH. Falls back
+// to strict equality when either side is unresolvable, and never merges
+// a venv python with its base interpreter. Exported for tests.
+export async function sameInterpreter(a: string, b: string): Promise<boolean> {
+  if (a === b) return true
+  const [ca, cb] = await Promise.all([canonicalBin(a), canonicalBin(b)])
+  if (!ca || !cb || ca.real !== cb.real) return false
+  return !ca.venv && !cb.venv
+}
+
 // Build the child environment: inherit everything (PATH/HOME matter) but
 // scrub operator PYREPL_* vars (file-only), then inject resolved transport.
 // Exported for tests pinning the isolation boundary.
@@ -94,6 +147,23 @@ export function contextRoots(ctx: ToolContext | ConfigRoots): ConfigRoots {
   return { worktree: ctx.worktree ?? null, directory: ctx.directory ?? null }
 }
 
+export type RunningTaskCheck = { responsive: boolean; runningId: string | null }
+
+// Single place asking the server what is running: init needs both the
+// responsiveness verdict (fail-closed on unknown state) and the id,
+// while interrupt/read only need the id for their blank-arg hint.
+export async function checkRunningTask(session: Session, timeoutMs: number): Promise<RunningTaskCheck> {
+  try {
+    const list = await rpc<TaskListResponse>(session, { op: "list" }, timeoutMs)
+    return {
+      responsive: true,
+      runningId: list?.tasks?.find((t) => t.task_status === "running")?.task_id ?? null,
+    }
+  } catch {
+    return { responsive: false, runningId: null }
+  }
+}
+
 export async function ensureSession(
   key: string,
   bin: string,
@@ -102,7 +172,7 @@ export async function ensureSession(
 ): Promise<{ session: Session; note: string | null }> {
   const loaded = preloaded ?? (await loadMergedConfig(ctx))
   const existing = sessions.get(key)
-  if (existing && !existing.dead && existing.bin === bin) {
+  if (existing && !existing.dead && (await sameInterpreter(existing.bin, bin))) {
     // Live session sticks (never kill a running task for config): refresh
     // TS-side knobs in place, Python-side knobs stay frozen at spawn.
     existing.config = loaded.config

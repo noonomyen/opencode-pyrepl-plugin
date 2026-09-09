@@ -1,9 +1,7 @@
 import type { ToolContext } from "@opencode-ai/plugin"
 import { tool } from "@opencode-ai/plugin"
 import { loadMergedConfig } from "../config.ts"
-import { rpc } from "../rpc.ts"
-import { contextRoots, ensureSession, resolveBin, sessions } from "../session.ts"
-import type { TaskListResponse } from "../types.ts"
+import { contextRoots, checkRunningTask, ensureSession, resolveBin, sameInterpreter, sessions } from "../session.ts"
 import { GUIDE, type ToolDeps } from "./common.ts"
 
 export function createInitTool(_deps: ToolDeps) {
@@ -25,7 +23,7 @@ export function createInitTool(_deps: ToolDeps) {
       const loaded = await loadMergedConfig(context)
       const bin = await resolveBin(args.bin_path ?? undefined, context, loaded.config)
       const existing = sessions.get(key)
-      if (existing && !existing.dead && existing.bin === bin) {
+      if (existing && !existing.dead && (await sameInterpreter(existing.bin, bin))) {
         existing.config = loaded.config
         existing.roots = contextRoots(context)
         return `REPL already running on ${bin} (${existing.version}). State preserved, exec count ${existing.execCount}.`
@@ -34,15 +32,7 @@ export function createInitTool(_deps: ToolDeps) {
         // Different interpreter means a respawn that wipes everything:
         // refuse while a task runs instead of killing it silently. An
         // unresponsive server fails CLOSED (no wipe on unknown state).
-        let runningId: string | null = null
-        let responsive = false
-        try {
-          const list = await rpc<TaskListResponse>(existing, { op: "list" }, loaded.config.rpc_timeout_ms)
-          responsive = true
-          runningId = list?.tasks?.find((t) => t.task_status === "running")?.task_id ?? null
-        } catch {
-          responsive = false
-        }
+        const { responsive, runningId } = await checkRunningTask(existing, loaded.config.rpc_timeout_ms)
         if (!responsive) {
           return (
             `init refused: REPL on ${existing.bin} is not responding, state unknown; ` +

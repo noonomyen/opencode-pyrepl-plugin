@@ -8,7 +8,7 @@ import {
   formatWarn,
 } from "../format.ts"
 import { killSession, rpc } from "../rpc.ts"
-import { sessions } from "../session.ts"
+import { checkRunningTask, sessions } from "../session.ts"
 import { GUIDE, clampWaitS, type ToolDeps } from "./common.ts"
 
 export function createInterruptTool(_deps: ToolDeps) {
@@ -30,13 +30,22 @@ export function createInterruptTool(_deps: ToolDeps) {
     async execute(args, context: ToolContext) {
       context.metadata({ title: `pyrepl interrupt ${args.task_id}` })
       const session = sessions.get(context.sessionID)
-      if (!session || session.dead) return `no REPL session active (task ${args.task_id} unknown)`
+      const taskId = typeof args.task_id === "string" ? args.task_id.trim() : ""
+      if (!session || session.dead) return `no REPL session active (task ${taskId || "unknown"} unknown)`
       session.config = (await loadMergedConfig(context)).config
+      if (!taskId) {
+        // Friendlier than "unknown task undefined": point at the running
+        // task when there is one, else say so.
+        const { runningId } = await checkRunningTask(session, session.config.rpc_timeout_ms)
+        return runningId
+          ? `task ${runningId} is still running; pass its task_id to pyrepl_interrupt to stop it`
+          : `no task running`
+      }
       const res = await rpc(
         session,
         {
           op: "interrupt",
-          task_id: args.task_id,
+          task_id: taskId,
           wait_s: clampWaitS(args.wait_s),
           mode: args.mode ?? "cooperative",
         },

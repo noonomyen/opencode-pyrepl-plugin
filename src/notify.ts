@@ -3,7 +3,6 @@ import {
   formatCompletionNotice,
   formatDeathNotice,
   formatLostNotice,
-  formatProgressNotice,
 } from "./format.ts"
 import { rpc } from "./rpc.ts"
 import { isTerminalTaskStatus, pendingNotify, sessions } from "./session.ts"
@@ -12,6 +11,16 @@ import type { NotifyClient, TaskListEntry, TaskListResponse } from "./types.ts"
 export function extractSessionId(props: Record<string, any>): string | undefined {
   const id: unknown = props.info?.id ?? props.sessionID ?? props.sessionId ?? props.id
   return typeof id === "string" ? id : undefined
+}
+
+// Park a wake-up for retry on the next session.idle event.
+function parkNotify(key: string, taskId: string, agent: string | undefined): void {
+  let set = pendingNotify.get(key)
+  if (!set) {
+    set = new Map()
+    pendingNotify.set(key, set)
+  }
+  set.set(taskId, agent)
 }
 
 // Push a prebuilt text into the agent's session. promptAsync admits the
@@ -37,12 +46,7 @@ export async function pushText(
     if (markNotified) sessions.get(key)?.notified.add(taskId)
     return true
   } catch {
-    let set = pendingNotify.get(key)
-    if (!set) {
-      set = new Map()
-      pendingNotify.set(key, set)
-    }
-    set.set(taskId, agent)
+    parkNotify(key, taskId, agent)
     return false
   }
 }
@@ -73,17 +77,12 @@ export async function deliverCompletion(
       return
     }
     if (res?.status === "error") return
-    // A parked entry resolved while the task still runs (e.g. a failed
-    // interim notice): the active waiter owns completion, drop the park.
+    // A parked entry resolved while the task still runs (e.g. a stale
+    // retry): the active waiter owns completion, drop the park.
     if (!isTerminalTaskStatus(res.status)) return
     await pushText(client, key, taskId, agent, formatCompletionNotice(taskId, res))
   } catch {
-    let set = pendingNotify.get(key)
-    if (!set) {
-      set = new Map()
-      pendingNotify.set(key, set)
-    }
-    set.set(taskId, agent)
+    parkNotify(key, taskId, agent)
   }
 }
 
@@ -96,12 +95,9 @@ export async function notifyWhenDone(
   key: string,
   taskId: string,
   agent: string | undefined,
-  progressS = 0,
 ): Promise<void> {
   const armed = sessions.get(key)
   const armedSeq = armed?.resetSeq ?? -1
-  const cadence = Number.isFinite(progressS) && progressS > 0 ? progressS : 0
-  let nextProgress = cadence > 0 ? Date.now() + cadence * 1000 : 0
   let listFails = 0
   try {
     for (;;) {
@@ -134,11 +130,6 @@ export async function notifyWhenDone(
       }
       listFails = 0
       if (!found || isTerminalTaskStatus(found.task_status)) break
-      if (nextProgress > 0 && Date.now() >= nextProgress) {
-        nextProgress += cadence * 1000
-        // Interim notice: never marks notified, completion still fires.
-        await pushText(client, key, taskId, agent, formatProgressNotice(taskId, found), false)
-      }
     }
     await deliverCompletion(client, key, taskId, agent)
   } catch {

@@ -776,3 +776,28 @@ test("interrupt wait_s bounds swallowing loops", async () => {
     await c.close()
   }
 }, 30000)
+
+test("error traceback shows user frames only, no engine paths", async () => {
+  const c = new ProcClient()
+  try {
+    const r = await c.call({
+      op: "execute", task_id: "t_tb", wait_ms: 5000,
+      code: "def boom():\n    1/0\nboom()",
+    })
+    expect(r.status).toBe("error")
+    expect(r.error?.type).toBe("ZeroDivisionError")
+    const tb: string = r.error?.traceback ?? ""
+    expect(tb).toContain('File "<repl>"')
+    expect(tb).toContain("ZeroDivisionError")
+    expect(tb).not.toContain("server.py")
+    expect(tb).not.toMatch(/File "\//)
+    const s = await c.call({
+      op: "execute", task_id: "t_syn", wait_ms: 5000, code: "def f(:\n  pass",
+    })
+    expect(s.status).toBe("error")
+    expect(s.error?.type).toBe("SyntaxError")
+    expect(s.error?.traceback ?? "").not.toMatch(/File "\//)
+  } finally {
+    await c.close()
+  }
+}, 15000)

@@ -3,7 +3,23 @@
  * Run: bun test tests/tools.test.ts
  */
 import { test, expect } from "bun:test"
-import { fakeCtx, loadPlugin, sleep } from "./helpers.ts"
+import { execSync } from "node:child_process"
+import { chmodSync, copyFileSync, mkdirSync, symlinkSync, writeFileSync } from "node:fs"
+import path from "node:path"
+import { fakeCtx, loadPlugin, sleep, testDir } from "./helpers.ts"
+import { sameInterpreter } from "../src/session.ts"
+
+// Private copy of the interpreter: a genuinely different binary
+// (different realpath) for tests that need a bin switch. A mere
+// spelling variant (/usr/bin/python3 vs python3) now counts as the
+// same interpreter and preserves state by design.
+function copyInterpreter(): string {
+  const src = execSync("command -v python3").toString().trim()
+  const dst = path.join(testDir("pyrepl-altbin-"), "python-copy")
+  copyFileSync(src, dst)
+  chmodSync(dst, 0o755)
+  return dst
+}
 
 const hooks: any = await loadPlugin()
 const t = hooks.tool
@@ -332,7 +348,7 @@ test("init fails closed when the server stops responding", async () => {
   sess?.proc.kill("SIGKILL")
   await sleep(500)
   if (sess) sess.dead = false
-  const r: string = await t.pyrepl_init.execute({ bin_path: "/usr/bin/python3" }, ctx)
+  const r: string = await t.pyrepl_init.execute({ bin_path: copyInterpreter() }, ctx)
   expect(r).toContain("not responding")
   expect(r).not.toContain("REPL ready")
   await (hooks as any).event({ event: { type: "session.deleted", properties: { info: { id: "tools-sess-initwedged" } } } })
@@ -350,12 +366,13 @@ test("init with different bin refused while running", async () => {
     if (Date.now() >= deadline) throw new Error("task never reached running")
     await sleep(200)
   }
-  const refused: string = await t.pyrepl_init.execute({ bin_path: "/usr/bin/python3" }, ctx)
+  const altBin = copyInterpreter()
+  const refused: string = await t.pyrepl_init.execute({ bin_path: altBin }, ctx)
   expect(refused).toContain("init refused")
   expect(refused).toContain("t_1")
   await t.pyrepl_interrupt.execute({ task_id: "t_1" }, ctx)
   await execP
-  const ok: string = await t.pyrepl_init.execute({ bin_path: "/usr/bin/python3" }, ctx)
+  const ok: string = await t.pyrepl_init.execute({ bin_path: altBin }, ctx)
   expect(ok).toMatch(/REPL (ready|already running)/)
 }, 60000)
 
@@ -388,3 +405,50 @@ test("interrupt wait_s: NaN clamps to default", async () => {
   const ri: string = await t.pyrepl_interrupt.execute({ task_id: m![1], wait_s: NaN }, ctx)
   expect(ri).toContain("interrupted")
 }, 15000)
+
+test("interrupt/read without task_id says no task running when idle", async () => {
+  const ctx = fakeCtx("tools-sess-noid")
+  await t.pyrepl_exec.execute({ code: "1 + 1" }, ctx)
+  expect(await t.pyrepl_interrupt.execute({}, ctx)).toBe("no task running")
+  expect(await t.pyrepl_read.execute({}, ctx)).toBe("no task running")
+})
+
+test("interrupt without task_id points at the running task", async () => {
+  const ctx = fakeCtx("tools-sess-noidrun")
+  const r: string = await t.pyrepl_exec.execute(
+    { code: "import time\ntime.sleep(30)", timeout_s: 1, on_timeout: "detach" }, ctx)
+  const m = r.match(/task (t_\d+)/)
+  expect(m).not.toBeNull()
+  expect(await t.pyrepl_interrupt.execute({}, ctx)).toContain(`task ${m![1]} is still running`)
+  await t.pyrepl_interrupt.execute({ task_id: m![1] }, ctx)
+}, 30000)
+
+test("sameInterpreter tolerates spelling, never merges venv with base", async () => {
+  const py = execSync("command -v python3").toString().trim()
+  expect(py.length).toBeGreaterThan(0)
+  expect(await sameInterpreter(py, py)).toBe(true)
+  expect(await sameInterpreter("python3", py)).toBe(true)
+  const dir = testDir("pyrepl-samebin-")
+  const link = path.join(dir, "py-link")
+  symlinkSync(py, link)
+  expect(await sameInterpreter(py, link)).toBe(true)
+  // Fake venv pointing at the same binary: different environment, not same.
+  const vbin = path.join(dir, "venv", "bin")
+  mkdirSync(vbin, { recursive: true })
+  writeFileSync(path.join(dir, "venv", "pyvenv.cfg"), "home = /x\n")
+  const vpy = path.join(vbin, "python")
+  symlinkSync(py, vpy)
+  expect(await sameInterpreter(py, vpy)).toBe(false)
+  expect(await sameInterpreter(vpy, vpy)).toBe(true)
+  expect(await sameInterpreter(py, "/definitely/not/python")).toBe(false)
+})
+
+test("init with different spelling of same interpreter preserves state", async () => {
+  const py = execSync("command -v python3").toString().trim()
+  const ctx = fakeCtx("tools-sess-samespell")
+  await t.pyrepl_exec.execute({ code: "keepme = 7" }, ctx)
+  const r: string = await t.pyrepl_init.execute({ bin_path: py }, ctx)
+  expect(r).toContain("State preserved")
+  const r2: string = await t.pyrepl_exec.execute({ code: "keepme + 1" }, ctx)
+  expect(r2).toContain("Out[2]: 8")
+})
