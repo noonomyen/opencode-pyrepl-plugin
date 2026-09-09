@@ -59,7 +59,7 @@ test("missing files resolve to defaults with no sources", async () => {
   const dir = mkdtempSync(path.join(tmpdir(), "pyrepl-cfg-empty-"))
   const loaded = await loadMergedConfig({ worktree: dir, directory: dir })
   expect(loaded.config.timeout_s).toBe(60)
-  expect(loaded.config.max_mem_mb).toBe(4096)
+  expect(loaded.config.max_mem_mb).toBe(0)
   expect(loaded.sources).toEqual([])
   expect(loaded.warnings).toEqual([])
 })
@@ -228,7 +228,7 @@ test("template config parses to defaults", async () => {
   writeProjectConfig(dir, CONFIG_TEMPLATE)
   const loaded = await loadMergedConfig({ worktree: dir, directory: dir })
   expect(loaded.config.timeout_s).toBe(60)
-  expect(loaded.config.max_mem_mb).toBe(4096)
+  expect(loaded.config.max_mem_mb).toBe(0)
   expect(loaded.warnings).toEqual([])
 })
 

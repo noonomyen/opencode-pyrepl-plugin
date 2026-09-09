@@ -28,7 +28,7 @@ export type TaskResponse = {
   elapsed_ms?: number
   cpu_ms?: number
   alloc_bytes?: number
-  peak_growth_bytes?: number
+  rss_bytes?: number
   vars?: number
   mem_limit_mb?: number
   mem_warn?: string
@@ -67,6 +67,7 @@ export type ProcSnapshot = {
   peak_rss_bytes?: number
   cwd?: string
   uptime_ms?: number
+  pid?: number
 }
 
 export type VarsEntry = {

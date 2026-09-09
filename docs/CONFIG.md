@@ -38,10 +38,10 @@ These apply when the session starts; restart opencode (or respawn via
 | `max_lines` / `max_bytes` | `5000` / `1000000` | Output kept per running task. |
 | `result_max_chars` / `result_max_store` | `4000` / `1000000` | Expression value preview / stored size. |
 | `recent_tasks` | `20` | How many past tasks are remembered. |
-| `max_mem_mb` | `4096` | `0` = off. Overuse raises `MemoryError` in the task. Unix only. |
+| `max_mem_mb` | `0` | `0` = off. Overuse raises `MemoryError` in the task. Unix only. |
 | `max_cpu_s` | `0` | `0` = off. Overuse restarts the server (state lost). Unix only. |
 | `max_nproc` | `0` | `0` = off. Fork-bomb guard. Unix only. |
-| `mem_warn_pct` | `80` | Warn-only threshold, evaluated once at task end (growth since task start); `0` = off. |
+| `mem_warn_pct` | `80` | Warn-only threshold, evaluated once at task end (growth since task start); `0` = off. Needs `max_mem_mb` > 0 to fire. |
 
 Advanced timing knobs (`wait_grace_ms`, `rpc_timeout_ms`,
 `notify_poll_ms`, `interrupt_wait_s`, `max_line_chars`,
@@ -69,7 +69,7 @@ Advanced timing knobs (`wait_grace_ms`, `rpc_timeout_ms`,
   "result_max_store": 1000000,
   "recent_tasks": 20,
   "interrupt_wait_s": 5,
-  "max_mem_mb": 4096,
+  "max_mem_mb": 0,
   "max_cpu_s": 0,
   "max_nproc": 0,
   "mem_warn_pct": 80

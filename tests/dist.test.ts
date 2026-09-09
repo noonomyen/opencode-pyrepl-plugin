@@ -19,7 +19,7 @@ distTest("pyz answers ping with version and limits", async () => {
     const r = await c.call({ op: "ping" }, 10000)
     expect(r.status).toBe("ok")
     expect(r.version).toBe("0.1.0")
-    expect(r.limits?.mem_limit_mb).toBe(4096)
+    expect(r.limits?.mem_limit_mb).toBe(0)
     expect(c.badLines).toEqual([])
   } finally {
     await c.close()

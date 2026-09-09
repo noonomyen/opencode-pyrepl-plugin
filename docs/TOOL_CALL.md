@@ -4,11 +4,12 @@ Stateful Python REPL. Variables, imports, and functions survive across
 calls. The first `pyrepl_exec` starts the session automatically; state is
 lost when opencode closes.
 
-Rules that apply to all tools:
+Behavior notes:
 
-- One task runs at a time. A second `exec` returns `busy`; use
-  `pyrepl_read` or `pyrepl_interrupt` first, or `exec` with `preempt`.
-- End code with a bare expression to see its value; print sparingly.
+- One task runs at a time. A second `exec` while one runs returns
+  `busy` (read or interrupt the running task first, or retry with `preempt`).
+- A trailing bare expression becomes the task value (`Out[n]`);
+  printed output is truncated in previews.
 - Finished tasks keep their value, not their printed lines.
 
 ## pyrepl_init
@@ -59,8 +60,8 @@ answers `no task running`.
 
 ## pyrepl_status
 
-Health check, no params. Shows interpreter, working directory, uptime,
-memory, and whether a task is running.
+Health check, no params. Shows interpreter, pid, working directory,
+uptime, memory, and whether a task is running.
 
 ## pyrepl_tasks
 

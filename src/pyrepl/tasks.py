@@ -40,7 +40,7 @@ class Task:
         self.peak_start = metrics._peak_rss_bytes()
         self.tm_start = None
         self.alloc_bytes = None
-        self.peak_growth_bytes = None
+        self.rss_bytes = None
         self.mem_warned = None
         self.vars = None
         # Set right after user code completes, before finish("done"): lets

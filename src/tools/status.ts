@@ -10,7 +10,7 @@ import { GUIDE, type ToolDeps } from "./common.ts"
 export function createStatusTool(_deps: ToolDeps) {
   return tool({
     description:
-      "Check the Python runtime is healthy without executing code: where it runs from (interpreter, cwd), uptime, memory vs caps, CPU appetite, namespace size, and any running task. Task history lives in pyrepl_tasks; variable listing in pyrepl_vars. Use to re-orient after compaction." +
+      "Check the Python runtime is healthy without executing code: where it runs from (interpreter, cwd), uptime, memory vs caps, CPU appetite, namespace size, and any running task. Task history lives in pyrepl_tasks; variable listing in pyrepl_vars. Use to re-orient after compaction. Never kill the shown engine process directly (kill/pkill can hit other sessions); stop it via pyrepl_interrupt mode=kill." +
       GUIDE,
     args: {},
     async execute(_args, context: ToolContext) {
@@ -36,6 +36,7 @@ export function createStatusTool(_deps: ToolDeps) {
       const running = (list?.tasks ?? []).filter((t) => t.task_status === "running")
       for (const t of running) out.push(`running: ${formatTaskLine(t, false)}`)
       if (running.length === 0) out.push("idle: no task running")
+      out.push("note: never kill this python process directly (kill/pkill can hit other sessions); stop it via pyrepl_interrupt mode=kill")
       return out.join("\n")
     },
   })

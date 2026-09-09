@@ -13,6 +13,18 @@ export function fmtMs(ms: number | undefined): string {
   return `${Number.isInteger(ms) ? ms : ms.toFixed(1)}ms`
 }
 
+// Human duration for slow-moving clocks (uptime, cpu totals): ms under a
+// second, then s, then m+s, then h+m.
+export function fmtDur(ms: number | undefined): string {
+  if (ms === undefined || !Number.isFinite(ms)) return "?"
+  if (ms < 1000) return fmtMs(ms)
+  const s = ms / 1000
+  if (s < 60) return `${Math.round(s * 10) / 10}s`
+  const m = Math.floor(s / 60)
+  if (m < 60) return `${m}m${Math.floor(s % 60)}s`
+  return `${Math.floor(m / 60)}h${m % 60}m`
+}
+
 // Unsigned magnitude; callers add their own sign when needed.
 export function fmtSize(bytes: number): string {
   const abs = Math.abs(bytes)
@@ -31,13 +43,7 @@ export function formatResources(res: TaskResponse): string {
     const a = res.alloc_bytes
     parts.push(`alloc=${a < 0 ? "-" : a > 0 ? "+" : ""}${fmtSize(a)}`)
   }
-  if (res.peak_growth_bytes !== undefined) {
-    const growth = res.peak_growth_bytes
-    const sign = growth < 0 ? "-" : growth > 0 ? "+" : ""
-    let peak = `peak=${sign}${fmtSize(growth)}`
-    if ((res.mem_limit_mb ?? 0) > 0) peak += `/${res.mem_limit_mb}MB`
-    parts.push(peak)
-  }
+  if (res.rss_bytes !== undefined) parts.push(`rss=${fmtSize(res.rss_bytes)}`)
   if (res.vars !== undefined) parts.push(`vars=${res.vars}`)
   return `[resources: ${parts.join(" ")}]`
 }
@@ -243,10 +249,11 @@ export function formatLimitsLine(limits: ServerLimits | null | undefined): strin
 export function formatProcLine(proc: ProcSnapshot | null | undefined): string[] {
   if (!proc) return []
   const parts: string[] = []
+  if (proc.pid !== undefined) parts.push(`pid=${proc.pid}`)
   if (proc.cwd !== undefined) parts.push(`cwd=${proc.cwd}`)
-  if (proc.uptime_ms !== undefined) parts.push(`uptime=${fmtMs(proc.uptime_ms)}`)
+  if (proc.uptime_ms !== undefined) parts.push(`uptime=${fmtDur(proc.uptime_ms)}`)
   if (proc.rss_bytes !== undefined) parts.push(`rss=${fmtSize(proc.rss_bytes)}`)
   if (proc.peak_rss_bytes !== undefined) parts.push(`peak=${fmtSize(proc.peak_rss_bytes)}`)
-  if (proc.cpu_total_ms !== undefined) parts.push(`cpu_total=${fmtMs(proc.cpu_total_ms)}`)
+  if (proc.cpu_total_ms !== undefined) parts.push(`cpu_total=${fmtDur(proc.cpu_total_ms)}`)
   return parts.length > 0 ? [`proc: ${parts.join(" ")}`] : []
 }

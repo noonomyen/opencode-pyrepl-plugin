@@ -172,7 +172,10 @@ test("status is a paramless health snapshot", async () => {
   expect(st).toContain("limits: mem=")
   expect(st).toContain("rss=")
   expect(st).toContain("cwd=")
+  expect(st).toMatch(/pid=\d+/)
+  expect(st).toMatch(/uptime=(\d+m\d+s|\d+(\.\d+)?s|\d+(\.\d+)?ms)/)
   expect(st).toContain("idle: no task running")
+  expect(st).toContain("never kill this python process directly")
 })
 
 test("tasks lists history, singles out one task, appends vars", async () => {
@@ -275,7 +278,7 @@ test("busy replies consume no id", async () => {
 test("every exec ends with a resource one-liner", async () => {
   const r: string = await t.pyrepl_exec.execute(
     { code: "m = [i for i in range(1000)]\nlen(m)" }, fakeCtx("tools-sess-metrics"))
-  expect(r).toMatch(/^\[resources: wall=[\d.]+ms( cpu=[\d.]+ms)?( alloc=[+-]?[\d.]+(B|KB|MB|GB))?( peak=[+-]?[\d.]+(B|KB|MB|GB)(\/\d+MB)?)? vars=\d+\]$/m)
+  expect(r).toMatch(/^\[resources: wall=[\d.]+ms( cpu=[\d.]+ms)?( alloc=[+-]?[\d.]+(B|KB|MB|GB))?( rss=[\d.]+(B|KB|MB|GB))? vars=\d+\]$/m)
   expect(r).not.toContain("exec #")
 })
 

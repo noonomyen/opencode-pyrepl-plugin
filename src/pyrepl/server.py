@@ -301,18 +301,16 @@ class ReplServer:
             task.cpu_ms = None
         try:
             if task.tm_start is not None:
-                current, peak = metrics._tracemalloc.get_traced_memory()
+                current = metrics._tracemalloc.get_traced_memory()[0]
                 if metrics._USE_TRACEMALLOC_ALLOC:
                     task.alloc_bytes = current - task.tm_start
-                if metrics._USE_TRACEMALLOC_PEAK:
-                    task.peak_growth_bytes = peak - task.tm_start
-            if task.peak_growth_bytes is None and task.peak_start is not None:
-                peak_end = metrics._peak_rss_bytes()
-                if peak_end is not None:
-                    task.peak_growth_bytes = peak_end - task.peak_start
+            # Absolute current RSS at task end: answers "how much pressure
+            # now", unlike growth deltas which saturate once HWM is high.
+            # None where unmeasurable (Linux /proc only); omitted there.
+            task.rss_bytes = metrics._current_rss_bytes()
         except Exception:
             task.alloc_bytes = None
-            task.peak_growth_bytes = None
+            task.rss_bytes = None
         try:
             task.vars = sum(1 for k in self.namespace if not k.startswith("__"))
         except Exception:
@@ -325,6 +323,13 @@ class ReplServer:
             snap = {"vars": sum(1 for k in self.namespace if not k.startswith("__"))}
         except Exception:
             snap = {"vars": len(self.namespace)}
+        # PID for ps-matching (display only: stop via tools, never kill
+        # directly, PIDs are shared across sessions). User code always runs
+        # on the main thread, so no thread id is needed.
+        try:
+            snap["pid"] = os.getpid()
+        except Exception:
+            pass
         try:
             snap["cwd"] = os.getcwd()
         except Exception:
@@ -344,11 +349,6 @@ class ReplServer:
         peak = metrics._peak_rss_bytes()
         if peak is not None:
             snap["peak_rss_bytes"] = peak
-        elif metrics._USE_TRACEMALLOC_PEAK:
-            try:
-                snap["rss_bytes"] = metrics._tracemalloc.get_traced_memory()[0]
-            except Exception:
-                pass
         return snap
 
     def _executor_loop(self):
@@ -788,8 +788,8 @@ class ReplServer:
             payload["cpu_ms"] = task.cpu_ms
         if task.alloc_bytes is not None:
             payload["alloc_bytes"] = task.alloc_bytes
-        if task.peak_growth_bytes is not None:
-            payload["peak_growth_bytes"] = task.peak_growth_bytes
+        if task.rss_bytes is not None:
+            payload["rss_bytes"] = task.rss_bytes
         if task.mem_warned is not None:
             payload["mem_warn"] = task.mem_warned
         if task.vars is not None:

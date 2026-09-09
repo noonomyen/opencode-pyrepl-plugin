@@ -223,10 +223,10 @@ test("per-task metrics: cpu, alloc, vars, mem limit", async () => {
   try {
     const r = await c.call({ op: "execute", task_id: "t_m", wait_ms: 8000, code: "v = [i for i in range(50000)]\nlen(v)" })
     expect(typeof r.cpu_ms === "number" && r.cpu_ms >= 0).toBe(true)
-    expect(typeof r.peak_growth_bytes === "number").toBe(true)
+    expect(typeof r.rss_bytes === "number" && r.rss_bytes > 0).toBe(true)
     expect(typeof r.alloc_bytes === "number" && r.alloc_bytes > 0).toBe(true)
     expect(typeof r.vars === "number" && r.vars >= 1).toBe(true)
-    expect(r.mem_limit_mb).toBe(4096)
+    expect(r.mem_limit_mb).toBe(0)
     const rd = await c.call({ op: "read", task_id: "t_m" })
     expect(typeof rd.cpu_ms === "number").toBe(true)
     expect(typeof rd.alloc_bytes === "number").toBe(true)
@@ -263,9 +263,10 @@ test("list carries live stats, proc block, limits block", async () => {
     expect(live2[0].elapsed_ms).toBeGreaterThan(live[0].elapsed_ms)
     expect(typeof r.proc?.rss_bytes === "number").toBe(true)
     expect(typeof r.proc?.cpu_total_ms === "number").toBe(true)
+    expect(typeof r.proc?.pid === "number" && (r.proc?.pid ?? 0) > 0).toBe(true)
     expect(typeof r.proc?.vars === "number").toBe(true)
-    expect(r.limits?.mem_limit_mb).toBe(4096)
-    expect(r.limits?.mem_enforced).toBe(true)
+    expect(r.limits?.mem_limit_mb).toBe(0)
+    expect(r.limits?.mem_enforced).toBe(false)
     await c.call({ op: "interrupt", task_id: "t_live" }, 15000)
     await pending
     const done = (await c.call({ op: "list" })).tasks?.filter((x: any) => x.task_id === "t_live") ?? []

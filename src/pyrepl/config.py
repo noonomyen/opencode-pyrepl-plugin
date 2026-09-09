@@ -29,7 +29,7 @@ INTERRUPT_WAIT_S = _env_int("PYREPL_INTERRUPT_WAIT_S", 5)
 # OOM the server either. Per-task rings stay at MAX_LINES/MAX_BYTES.
 ORPHAN_MAX_LINES = _env_int("PYREPL_ORPHAN_MAX_LINES", 100000)
 ORPHAN_MAX_BYTES = _env_int("PYREPL_ORPHAN_MAX_BYTES", 32 * 1024 * 1024)
-MAX_MEM_MB = _env_int("PYREPL_MAX_MEM_MB", 4096, minimum=0)
+MAX_MEM_MB = _env_int("PYREPL_MAX_MEM_MB", 0, minimum=0)
 MAX_CPU_S = _env_int("PYREPL_MAX_CPU_S", 0, minimum=0)
 # Off by default: the cap is UID-wide (shared with every other process of
 # this user), so a blind default breaks boot on busy machines. Opt in with

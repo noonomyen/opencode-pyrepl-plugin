@@ -59,7 +59,7 @@ export const DEFAULT_CONFIG: ResolvedConfig = {
   result_max_store: 1000000,
   recent_tasks: 20,
   interrupt_wait_s: 5,
-  max_mem_mb: 4096,
+  max_mem_mb: 0,
   max_cpu_s: 0,
   max_nproc: 0,
   mem_warn_pct: 80,
@@ -399,7 +399,7 @@ export const CONFIG_TEMPLATE = `{
   "result_max_store": 1000000,
   "recent_tasks": 20,
   "interrupt_wait_s": 5,
-  "max_mem_mb": 4096,       // 0 = off; overuse raises MemoryError in the task
+  "max_mem_mb": 0,           // 0 = off; overuse raises MemoryError in the task
   "max_cpu_s": 0,           // 0 = off; overuse kills the server (respawned fresh)
   "max_nproc": 0,           // 0 = off; UID-wide anti fork-bomb cap
   "mem_warn_pct": 80        // warn-only past this % of max_mem_mb, 0 = off
