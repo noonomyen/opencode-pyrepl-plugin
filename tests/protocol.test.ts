@@ -420,20 +420,19 @@ test("MEM=0 disables the cap", async () => {
 test("mem warn fires past threshold, absent otherwise", async () => {
   const c = new ProcClient({ PYREPL_MAX_MEM_MB: "512", PYREPL_MEM_WARN_PCT: "10" })
   try {
+    // Completion-time evaluation: no sleep needed, delivery never depends
+    // on dispatcher polls (a starved dispatcher must not lose the warn).
     const r = await c.call({
       op: "execute", task_id: "t_w", wait_ms: 8000,
-      code: "import time\nbig = bytearray(100 * 1024 * 1024)\ntime.sleep(2)\n1",
+      code: "big = bytearray(100 * 1024 * 1024)\n1",
     })
     expect(r.status).toBe("done")
     expect(typeof r.mem_warn === "string" && r.mem_warn.includes("10%")).toBe(true)
     const small = await c.call({ op: "execute", task_id: "t_nw", wait_ms: 8000, code: "1 + 1" })
     expect(small.mem_warn ?? null).toBeNull()
-    // Delta semantics: a long innocent task after a big transient alloc
-    // must not warn by association with the stale high-water mark.
-    const innocent = await c.call({
-      op: "execute", task_id: "t_in", wait_ms: 8000,
-      code: "import time\ntime.sleep(2)\n2",
-    })
+    // Delta semantics: an innocent task after a big hoard must not warn
+    // by association with the stale high-water mark.
+    const innocent = await c.call({ op: "execute", task_id: "t_in", wait_ms: 8000, code: "2" })
     expect(innocent.status).toBe("done")
     expect(innocent.mem_warn ?? null).toBeNull()
   } finally {

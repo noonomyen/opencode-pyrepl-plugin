@@ -285,6 +285,16 @@ class ReplServer:
     def _finalize_metrics(self, task):
         """Snapshot per-task cpu/alloc/peak-rss/namespace size. Never raises."""
         try:
+            # Sole mem-warn evaluation point, at task completion: ru_maxrss
+            # is monotonic, so end-of-task growth subsumes anything mid-run.
+            # Deliberately not polled mid-run (by design the warn reports a
+            # process hoarding data at task end), which also keeps delivery
+            # independent of dispatcher tick timing under CPU starvation.
+            # One-shot, same message. Never raises.
+            metrics._check_mem_warn(task)
+        except Exception:
+            pass
+        try:
             if task.cpu_start is not None and metrics._CPU_CLOCK is not None:
                 task.cpu_ms = round((metrics._CPU_CLOCK() - task.cpu_start) * 1000, 1)
         except Exception:
@@ -398,9 +408,6 @@ class ReplServer:
                 else:
                     self._handle_line(line)
                 self._poll_waiters()
-                running = self._running_task()
-                if running is not None:
-                    metrics._check_mem_warn(running)
             except Exception:
                 try:
                     traceback.print_exc(file=sys.__stderr__)

@@ -41,7 +41,7 @@ These apply when the session starts; restart opencode (or respawn via
 | `max_mem_mb` | `4096` | `0` = off. Overuse raises `MemoryError` in the task. Unix only. |
 | `max_cpu_s` | `0` | `0` = off. Overuse restarts the server (state lost). Unix only. |
 | `max_nproc` | `0` | `0` = off. Fork-bomb guard. Unix only. |
-| `mem_warn_pct` | `80` | Warn-only threshold; `0` = off. |
+| `mem_warn_pct` | `80` | Warn-only threshold, evaluated once at task end (growth since task start); `0` = off. |
 
 Advanced timing knobs (`wait_grace_ms`, `rpc_timeout_ms`,
 `notify_poll_ms`, `interrupt_wait_s`, `max_line_chars`,

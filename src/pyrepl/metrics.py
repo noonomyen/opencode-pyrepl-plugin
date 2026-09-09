@@ -166,12 +166,15 @@ def _apply_limits():
 
 
 def _check_mem_warn(task):
-    """One-shot RSS warning for a running task. Warn-only, never kills.
+    """One-shot RSS warning for a task, evaluated once at task completion.
+    Warn-only, never kills.
 
     Compares high-water GROWTH since the task started (not the absolute
     high-water, which earlier tasks may have left behind), so an innocent
-    long task after a big transient alloc does not warn by association.
-    Only fires for tasks alive past one wait slice (~0.1s).
+    task after a big hoard does not warn by association. By design this
+    reports a process hoarding data at task end, not a mid-run sample:
+    ru_maxrss is monotonic, so the end-of-task delta covers any transient
+    spike during the run as well.
     """
     if task.mem_warned is not None or config.MEM_WARN_PCT <= 0:
         return
