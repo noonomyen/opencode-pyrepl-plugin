@@ -18,7 +18,7 @@ opencode resolves the package entry (`exports["./server"]`) and loads it
 in place. Or install the bundled artifacts outright:
 
 ```sh
-bun run deploy            # global: ~/.config/opencode/plugins/
+bun run deploy            # global: ~/.config/opencode/plugins/ (--global is explicit)
 bun src/install.ts --project   # project-local: ./.opencode/plugins/
 bun src/install.ts --link      # symlink dist/ instead of copy (rebuild to update)
 ```
@@ -45,7 +45,8 @@ which overrides built-in defaults. Missing files are fine.
 ```jsonc
 {
   "python": null,         // interpreter; null = auto (.venv, then python3)
-  "timeout_s": 30,        // per-exec wait; the task keeps running after it
+  "timeout_s": 30,        // per-exec wait
+  "on_timeout": "interrupt",// "interrupt" (stop it, return partial output) or "detach" (keep running, return task_id)
   "wait_grace_ms": 15000,
   "rpc_timeout_ms": 15000,
   "preview_lines": 100, "preview_head": 1000, "preview_tail": 2500,
@@ -71,14 +72,17 @@ engine knobs into the subprocess; the engine itself never reads files.
 | Tool | Purpose |
 | ---- | ------- |
 | `pyrepl_init` | Pick an interpreter (`bin_path`, else `python` in `pyrepl.jsonc`, `.venv`, `python3`). Optional; `exec` auto-initializes. |
-| `pyrepl_exec` | Run code. `reset: true` wipes state and runs in one step. `preempt: true` interrupts the running task first, then runs. `progress_s` sends interim still-running notices. Long runs return a `task_id` instead of blocking. |
-| `pyrepl_read` | Poll a running task or page truncated output (`offset`/`limit`, `grep`, `tail_lines`, targets `stdout/stderr/combined/result/orphan`). |
-| `pyrepl_status` | Show live session state (`task_id` drills into one task; `limit`/`filter` opt into task history, otherwise live info only). |
-| `pyrepl_interrupt` | Stop a running task (`wait_s` bounds the wait), keep the session. |
+| `pyrepl_exec` | Run code. `reset: true` wipes state and runs in one step. `preempt: true` interrupts the running task first, then runs. `progress_s` sends interim still-running notices. `on_timeout` decides what happens at `timeout_s` expiry (`interrupt` default, `detach` returns a `task_id` instead of blocking). |
+| `pyrepl_read` | Poll a running task or page its output (`offset`/`limit`, `grep`, `tail_lines`, targets `stdout/stderr/combined/result/orphan`). Finished tasks keep values, not lines. |
+| `pyrepl_status` | Health snapshot, no params: interpreter, cwd, uptime, memory vs caps, CPU, namespace size, running task. |
+| `pyrepl_tasks` | List tasks (`task_id` singles one out; `limit`/`filter` page history) plus the compact namespace listing. |
+| `pyrepl_vars` | List namespace variables (type, length, approximate size, preview) or inspect one in full. Read-only. |
+| `pyrepl_interrupt` | Stop a running task (`wait_s` bounds the wait; `mode=kill` SIGKILLs the server for signal-immune tasks, wiping all state), keep the session otherwise. |
 
 The first `exec` of a session notes it is fresh (state is new and dies with
-opencode). Timeouts never kill: the task keeps running until read or
-interrupted. When a background task finishes, the agent is automatically
+opencode). On `timeout_s` expiry the task is interrupted by default
+(`on_timeout=detach` keeps it running and returns a `task_id` instead).
+When a detached background task finishes, the agent is automatically
 notified in its own session with the result, so it wakes up on its own
 instead of polling (disable via `notify_agent` in `pyrepl.jsonc`).
 
@@ -88,16 +92,24 @@ instead of polling (disable via `notify_agent` in `pyrepl.jsonc`).
 per opencode session: `dist/pyrepl.pyz` in prod, `src/pyrepl/` package
 (or its `pyrepl_server.py` shim) in dev. The engine is stdlib-only and
 speaks newline-delimited JSON over stdio (`ping`, `execute`, `read`,
-`list`, `interrupt`, `reset`, `shutdown`); responses carry the request
-`id`. Source layout: `src/config|types|rpc|session|format|notify.ts`,
+`interrupt`, `reset`, `vars`, `list`, `shutdown`); responses carry the
+request `id`. Source layout: `src/config|types|rpc|session|format|notify.ts`,
 `src/tools/*.ts` assembled by `src/plugin.ts`;
-`src/pyrepl/{config,metrics,buffers,tasks,protocol,server}.py`.
+`src/pyrepl/{config,metrics,buffers,tasks,protocol,server}.py`. User code
+runs on the server's main thread so OS signals reach it; interrupt is
+two-phase (SIGINT first, `_TaskKill` shortly after if still running).
 
 ## Limits
 
 - No sandbox: code runs as your user. No state across opencode restarts.
 - Single-flight: one task per session at a time. A second `exec` returns
   `busy` (retry after `read`/`interrupt`, or `exec` with `preempt: true`).
+- Output retention: per-task rings hold 1MB/5000 lines while running
+  (lines over 10KB are split); lines are dropped when the task finishes
+  (result, error, totals stay). Late background-thread output lands in a
+  process-wide 32MB/100k-line orphan ring (`target=orphan`). Variable
+  inspect caps repr at 100KB. Print sparingly; end code with a bare
+  expression to see its value instead.
 - Resource caps (Unix only, reported as unenforced elsewhere):
   `max_mem_mb` via `RLIMIT_AS` (overuse raises `MemoryError` in the
   task, the session survives), `max_cpu_s` via `RLIMIT_CPU`
@@ -112,10 +124,13 @@ speaks newline-delimited JSON over stdio (`ping`, `execute`, `read`,
   `alloc` is net Python bytes (negative = freed, misses native allocs),
   fields are omitted where the platform cannot measure them.
 - No magics, no inline plots (`Agg` + save-to-file), no `input()`/`pdb`.
-- `interrupt` injects a private `_TaskKill` exception (escapes
-  `except KeyboardInterrupt`, unlike SIGINT); Python-level loops die at once,
-  native calls (e.g. `time.sleep`) take effect when they return, and calls
-  that never return need a respawn.
+- `interrupt` is two-phase: SIGINT first (breaks sleeps, locks, subprocess
+  waits, and loops that only catch `KeyboardInterrupt` at an uncovered
+  spot), then `_TaskKill` (escapes `except KeyboardInterrupt`) if still
+  running. Code swallowing both (`except BaseException` around everything,
+  GIL-holding C loops) needs `mode=kill` or a respawn.
+- `pyrepl_init` with a different interpreter is refused while a task runs
+  (interrupt first); switching wipes all state.
 
 ## Development
 
@@ -123,6 +138,6 @@ speaks newline-delimited JSON over stdio (`ping`, `execute`, `read`,
 bun run typecheck   # tsc --noEmit (typescript is a devDependency)
 bun run build       # dist/pyrepl.js (bun bundle) + dist/pyrepl.pyz (zipapp)
 bun run deploy      # build + install to ~/.config/opencode/plugins/
-bun test tests/     # bun:test suites (protocol/tools/config fast, slow every run)
+bun test tests/     # bun:test suites (protocol/tools/config/dist fast, slow every run)
 ruff check src/     # Python lint (rule set pinned in ruff.toml)
 ```

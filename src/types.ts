@@ -47,6 +47,7 @@ export type TaskResponse = {
   result_full?: string | null
   error?: TaskError
   message?: string
+  note?: string
 }
 
 export type TaskListEntry = {
@@ -64,6 +65,28 @@ export type ProcSnapshot = {
   cpu_total_ms?: number
   rss_bytes?: number
   peak_rss_bytes?: number
+  cwd?: string
+  uptime_ms?: number
+}
+
+export type VarsEntry = {
+  name: string
+  type: string
+  size?: number | null
+  length?: number | string | null
+  dtype?: string
+  preview?: string
+  preview_full?: string
+  truncated?: boolean
+}
+
+export type VarsResponse = {
+  status: string
+  count?: number
+  vars?: VarsEntry[]
+  truncated?: boolean
+  full?: string
+  message?: string
 }
 
 export type ServerLimits = {

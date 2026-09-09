@@ -8,7 +8,7 @@ from .buffers import LineBuffer
 
 
 class _TaskKill(BaseException):
-    """Cooperative kill signal injected into a worker thread.
+    """Cooperative kill signal injected into the executor (main) thread.
 
     Deliberately NOT KeyboardInterrupt: user code routinely catches
     KeyboardInterrupt (ignore-Ctrl+C loops) or swallows it via bare
@@ -30,7 +30,6 @@ class Task:
         self.result_store_truncated = False
         self.error = None
         self.done = threading.Event()
-        self.thread = None
         self.started = time.monotonic()
         self.ended = None
         # Baselines are process-wide so the creating thread does not matter,
@@ -44,14 +43,21 @@ class Task:
         self.peak_growth_bytes = None
         self.mem_warned = None
         self.vars = None
-        # Guards status/thread-identity checks so interrupt() can never
-        # inject into a recycled thread. The worker sets its terminal status
-        # under this lock before exiting; interrupt() only injects while the
-        # task still reports running under the same lock.
+        # Set right after user code completes, before finish("done"): lets
+        # the interrupt handlers tell a stale arming (natural finish) apart
+        # from a live kill. Plain flag, GIL-atomic.
+        self.completed_ok = False
+        # Guards status checks so interrupt() only targets the live task on
+        # the executor: inject paths verify status under this lock, so a
+        # recycled task id (after reset) can never receive a stale inject.
+        # The executor itself writes status lock-free (single-flight: it is
+        # the only writer), so this lock never blocks it.
         self.lock = threading.Lock()
 
     def finish(self, status):
-        with self.lock:
-            self.status = status
-            if self.ended is None:
-                self.ended = time.monotonic()
+        # Lock-free by design (see server._run_task): the executor is the
+        # only writer, single-flight; dispatcher reads take the lock but
+        # never block since nobody else takes it on this path.
+        self.status = status
+        if self.ended is None:
+            self.ended = time.monotonic()

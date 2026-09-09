@@ -8,6 +8,8 @@ import { createInitTool } from "./tools/init.ts"
 import { createInterruptTool } from "./tools/interrupt.ts"
 import { createReadTool } from "./tools/read.ts"
 import { createStatusTool } from "./tools/status.ts"
+import { createTasksTool } from "./tools/tasks.ts"
+import { createVarsTool } from "./tools/vars.ts"
 import type { NotifyClient } from "./types.ts"
 
 export const PyReplPlugin: Plugin = async (ctx) => {
@@ -45,6 +47,8 @@ export const PyReplPlugin: Plugin = async (ctx) => {
       pyrepl_exec: createExecTool(deps),
       pyrepl_read: createReadTool(deps),
       pyrepl_status: createStatusTool(deps),
+      pyrepl_tasks: createTasksTool(deps),
+      pyrepl_vars: createVarsTool(deps),
       pyrepl_interrupt: createInterruptTool(deps),
     },
   }

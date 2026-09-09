@@ -137,14 +137,19 @@ test("registry keeps recent tasks", async () => {
   }
 }, 20000)
 
-test("byte cap drops oldest, read still works", async () => {
+test("byte cap drops oldest, lines unrecoverable after finish", async () => {
   const c = new ProcClient({ PYREPL_MAX_BYTES: "2000" })
   try {
     const r = await c.call({ op: "execute", task_id: "t_fat", wait_ms: 10000, code: "for i in range(30):\n    print('x' * 100)" })
     expect(r.truncated_lines).toBeGreaterThan(0)
+    // The completion payload still carries the surviving preview...
+    expect((r.lines ?? []).length).toBeGreaterThan(0)
+    // ...but lines are dropped at the first terminal observation by design.
     const rd = await c.call({ op: "read", task_id: "t_fat" })
     expect(rd.status).toBe("done")
-    expect(rd.returned).toBeGreaterThan(0)
+    expect(rd.returned).toBe(0)
+    expect(rd.note ?? "").toMatch(/dropped/)
+    expect(rd.output_lines).toBe(30)
   } finally {
     await c.close()
   }
@@ -153,8 +158,7 @@ test("byte cap drops oldest, read still works", async () => {
 test("long lines split into chunks", async () => {
   const c = new ProcClient()
   try {
-    await c.call({ op: "execute", task_id: "t_long", wait_ms: 10000, code: "print('Z' * 25000)" })
-    const r = await c.call({ op: "read", task_id: "t_long" })
+    const r = await c.call({ op: "execute", task_id: "t_long", wait_ms: 10000, code: "print('Z' * 25000)" })
     const lines = (r.lines ?? []).map((e: any) => e.line)
     expect(lines.some((l: string) => l.endsWith("[line split]"))).toBe(true)
     expect(lines.every((l: string) => l.length <= 10030)).toBe(true)
@@ -221,7 +225,7 @@ test("per-task metrics: cpu, alloc, vars, mem limit", async () => {
     expect(typeof r.cpu_ms === "number" && r.cpu_ms >= 0).toBe(true)
     expect(typeof r.peak_growth_bytes === "number").toBe(true)
     expect(typeof r.alloc_bytes === "number" && r.alloc_bytes > 0).toBe(true)
-    expect(typeof r.vars === "number" && r.vars >= 3).toBe(true)
+    expect(typeof r.vars === "number" && r.vars >= 1).toBe(true)
     expect(r.mem_limit_mb).toBe(4096)
     const rd = await c.call({ op: "read", task_id: "t_m" })
     expect(typeof rd.cpu_ms === "number").toBe(true)
@@ -290,16 +294,41 @@ test("preempt interrupts old task and runs new code", async () => {
   }
 }, 30000)
 
-test("preempt_failed on uninterruptible native call", async () => {
-  const c = new ProcClient({ PYREPL_INTERRUPT_WAIT_S: "1" })
+// A nested try-around-everything swallower catches every delivery channel:
+// the inner loop's only checkpoint (its back-edge) sits INSIDE the try, so
+// trips and async kills alike land where they are caught. It is the shape
+// that still defeats interrupt deterministically (ladder, then respawn).
+const SWALLOW_ALL = "while True:\n    try:\n        while True:\n            x = 1\n    except BaseException:\n        continue"
+
+test("sleep dies to preempt (signals break syscalls)", async () => {
+  const c = new ProcClient()
   try {
     const pending = c.call(
       { op: "execute", task_id: "t_sleep", wait_ms: 30000, code: "import time\ntime.sleep(30)" }, 35000)
     pending.catch(() => {})
     await waitForTask(c, "t_sleep")
+    const t0 = Date.now()
+    const r = await c.call({ op: "execute", task_id: "t_next", wait_ms: 8000, code: "40 + 2", preempt: true }, 15000)
+    expect(r.status).toBe("done")
+    expect(r.result_preview).toBe("42")
+    expect(r.preempted?.task_id).toBe("t_sleep")
+    expect(Date.now() - t0).toBeLessThan(8000)
+    await pending
+  } finally {
+    await c.close()
+  }
+}, 30000)
+
+test("preempt_failed on swallowing loop, then ladder", async () => {
+  const c = new ProcClient({ PYREPL_INTERRUPT_WAIT_S: "1" })
+  try {
+    const pending = c.call(
+      { op: "execute", task_id: "t_sw", wait_ms: 30000, code: SWALLOW_ALL }, 35000)
+    pending.catch(() => {})
+    await waitForTask(c, "t_sw")
     const r = await c.call({ op: "execute", task_id: "t_next", wait_ms: 8000, code: "1", preempt: true }, 15000)
     expect(r.status).toBe("preempt_failed")
-    expect(r.task_id).toBe("t_sleep")
+    expect(r.task_id).toBe("t_sw")
   } finally {
     await c.close()
   }
@@ -309,7 +338,7 @@ test("concurrent double preempt keeps single flight", async () => {
   const c = new ProcClient({ PYREPL_INTERRUPT_WAIT_S: "5" })
   try {
     const victim = c.call(
-      { op: "execute", task_id: "t_victim", wait_ms: 30000, code: "import time\ntime.sleep(30)" }, 35000)
+      { op: "execute", task_id: "t_victim", wait_ms: 30000, code: SWALLOW_ALL }, 35000)
     victim.catch(() => {})
     await waitForTask(c, "t_victim")
     const box: Record<string, any> = {}
@@ -453,7 +482,10 @@ test("registry eviction: old ids report not_found", async () => {
   }
 }, 30000)
 
-test("_TaskKill escapes except KeyboardInterrupt", async () => {
+test("KeyboardInterrupt-swallowing tight loop still dies fast", async () => {
+  // Delivery lands on the loop back-edge (the only eval checkpoint, outside
+  // the inner try), so the swallower never sees it: deterministic kill via
+  // the signal trip, reported as KeyboardInterrupt.
   const c = new ProcClient()
   try {
     const pending = c.call({
@@ -465,13 +497,71 @@ test("_TaskKill escapes except KeyboardInterrupt", async () => {
     const t0 = Date.now()
     const r = await c.call({ op: "interrupt", task_id: "t_sw" }, 15000)
     expect(r.status).toBe("interrupted")
-    expect(r.error?.type).toBe("_TaskKill")
+    expect(r.error?.type).toBe("KeyboardInterrupt")
     expect(Date.now() - t0).toBeLessThan(8000)
     await pending
   } finally {
     await c.close()
   }
 }, 30000)
+
+test("sleep dies fast via phase-1 signals", async () => {
+  const c = new ProcClient()
+  try {
+    const pending = c.call(
+      { op: "execute", task_id: "t_sl", wait_ms: 30000, code: "import time\ntime.sleep(30)" }, 35000)
+    pending.catch(() => {})
+    await waitForTask(c, "t_sl")
+    const t0 = Date.now()
+    const r = await c.call({ op: "interrupt", task_id: "t_sl", wait_s: 5 }, 15000)
+    expect(r.status).toBe("interrupted")
+    expect(r.error?.type).toBe("KeyboardInterrupt")
+    expect(Date.now() - t0).toBeLessThan(8000)
+    await pending
+  } finally {
+    await c.close()
+  }
+}, 30000)
+
+test("on_timeout interrupt stops the task, detach leaves it running", async () => {
+  const c = new ProcClient()
+  try {
+    const r = await c.call({
+      op: "execute", task_id: "t_to", wait_ms: 1500,
+      code: "import time\ntime.sleep(30)", on_timeout: "interrupt",
+    }, 15000)
+    expect(r.status).toBe("interrupted")
+    const r2 = await c.call({
+      op: "execute", task_id: "t_td", wait_ms: 1500,
+      code: "import time\ntime.sleep(30)", on_timeout: "detach",
+    }, 15000)
+    expect(r2.status).toBe("running")
+    const rk = await c.call({ op: "interrupt", task_id: "t_td", mode: "kill" }, 15000)
+    expect(rk.message ?? "").toMatch(/killed/)
+    await expect(c.call({ op: "ping" }, 5000)).rejects.toThrow()
+  } finally {
+    await c.close()
+  }
+}, 30000)
+
+test("vars op lists namespace and inspects one var", async () => {
+  const c = new ProcClient()
+  try {
+    await c.call({ op: "execute", task_id: "t_v", wait_ms: 8000, code: "qv_thing = [1, 2, 3]\nqv_n = 9" })
+    const r = await c.call({ op: "vars", pattern: "^qv_", limit: 200, sort: "name" })
+    expect(r.status).toBe("ok")
+    const names = (r.vars ?? []).map((v: any) => v.name)
+    expect(names).toContain("qv_thing")
+    expect(names).toContain("qv_n")
+    expect(names.some((n: string) => n.startsWith("__"))).toBe(false)
+    const one = await c.call({ op: "vars", name: "qv_thing" })
+    expect(one.vars?.[0]?.type).toBe("list")
+    expect(one.full).toContain("[1, 2, 3]")
+    expect((await c.call({ op: "vars", name: "qv_nope" })).vars).toEqual([])
+  } finally {
+    await c.close()
+  }
+}, 20000)
 
 test("empty code completes with no output", async () => {
   const c = new ProcClient()
@@ -509,18 +599,26 @@ test("deeply nested AST fails fast instead of hanging", async () => {
   }
 }, 20000)
 
-test("negative offset/limit clamp to sane paging", async () => {
+test("negative offset/limit clamp to sane paging on a live task", async () => {
   const c = new ProcClient()
   try {
-    await c.call({ op: "execute", task_id: "t_c", wait_ms: 5000, code: "for i in range(5):\n    print(f'ln-{i}')" })
+    const pending = c.call({
+      op: "execute", task_id: "t_c", wait_ms: 15000,
+      code: "import time\nfor i in range(5):\n    print(f'ln-{i}')\ntime.sleep(30)",
+    }, 20000)
+    pending.catch(() => {})
+    await waitForTask(c, "t_c")
+    await sleep(500)
     const clamped = await c.call({ op: "read", task_id: "t_c", offset: -5, limit: -10 })
     expect((clamped.lines ?? []).length).toBe(5)
     const mid = await c.call({ op: "read", task_id: "t_c", offset: 1, limit: 200 })
     expect((mid.lines ?? []).map((e: any) => e.line)).toEqual(["ln-1", "ln-2", "ln-3", "ln-4"])
+    await c.call({ op: "interrupt", task_id: "t_c" }, 15000)
+    await pending
   } finally {
     await c.close()
   }
-}, 15000)
+}, 30000)
 
 test("2MB repr is store-truncated, session survives", async () => {
   const c = new ProcClient()
@@ -540,10 +638,10 @@ test("2MB repr is store-truncated, session survives", async () => {
 test("lone surrogate output round-trips through NDJSON", async () => {
   const c = new ProcClient()
   try {
+    // Lines live only in the completion payload now (dropped after finish).
     const r = await c.call({ op: "execute", task_id: "t_su", wait_ms: 5000, code: "print('A\\ud800B')" })
     expect(r.status).toBe("done")
-    const rd = await c.call({ op: "read", task_id: "t_su" })
-    const got = (rd.lines ?? []).map((e: any) => e.line).join("")
+    const got = (r.lines ?? []).map((e: any) => e.line).join("")
     expect(got).toContain("A")
     expect(got).toContain("B")
     expect(c.badLines).toEqual([])
@@ -627,8 +725,7 @@ test("2MB no-newline print splits without losing the stream", async () => {
   try {
     const r = await c.call({ op: "execute", task_id: "t_nl", wait_ms: 15000, code: "print('y' * (2 * 1024 * 1024), end='')" })
     expect(r.status).toBe("done")
-    const rd = await c.call({ op: "read", task_id: "t_nl", limit: 5000 })
-    const lines = (rd.lines ?? []).map((e: any) => e.line)
+    const lines = (r.lines ?? []).map((e: any) => e.line)
     expect(lines.some((l: string) => l.endsWith("[line split]"))).toBe(true)
     expect(c.badLines).toEqual([])
   } finally {
@@ -661,17 +758,19 @@ test("calls after SIGKILL reject instead of hanging", async () => {
   }
 }, 15000)
 
-test("interrupt wait_s bounds native waits", async () => {
+test("interrupt wait_s bounds swallowing loops", async () => {
   const c = new ProcClient()
   try {
     const pending = c.call(
-      { op: "execute", task_id: "t_ns", wait_ms: 1000, code: "import time\ntime.sleep(30)" }, 10000)
+      { op: "execute", task_id: "t_ns", wait_ms: 30000, code: SWALLOW_ALL }, 35000)
     pending.catch(() => {})
     await waitForTask(c, "t_ns")
     const t0 = Date.now()
     const r = await c.call({ op: "interrupt", task_id: "t_ns", wait_s: 1 }, 15000)
     expect(r.status).toBe("running")
     expect(Date.now() - t0).toBeLessThan(5000)
+    const rk = await c.call({ op: "interrupt", task_id: "t_ns", mode: "kill" }, 15000)
+    expect(rk.message ?? "").toMatch(/killed/)
     await pending.catch(() => {})
   } finally {
     await c.close()

@@ -27,7 +27,7 @@
     "typecheck": "tsc --noEmit",
     "lint": "ruff check src/",
     "test": "bun test tests/",
-    "test:fast": "bun test tests/protocol.test.ts tests/tools.test.ts tests/config.test.ts",
+    "test:fast": "bun test tests/protocol.test.ts tests/tools.test.ts tests/config.test.ts tests/dist.test.ts",
     "test:slow": "bun test tests/slow.test.ts",
     "ci": "bun run typecheck && bun run lint && bun run build && bun test tests/",
     "prepack": "find src tests -name __pycache__ -type d -prune -exec rm -rf {} +"

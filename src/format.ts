@@ -150,11 +150,19 @@ export function formatExecResult(
   }
   session.execCount = res.n ?? session.execCount
   if (res.preempted) out.push(`[preempted ${res.preempted.task_id} (${res.preempted.status})]`)
+  // Generic errors carry their reason in message (not the error object).
+  if (res.status === "error" && res.message) out.push(res.message)
+  // Lines are gone at completion (dropped, not just unshown): only promise
+  // target=result when the task actually produced a value.
+  const cutHint =
+    res.result_preview !== undefined
+      ? `... [output truncated at completion; older lines were dropped, use pyrepl_read task_id=${res.task_id} target=result for the value]`
+      : `... [output truncated at completion; older lines were dropped]`
   out.push(
     ...formatOutputPreview(
       res,
       `task ${res.task_id ?? "?"}`,
-      `... [output truncated, use pyrepl_read with task_id=${res.task_id}]`,
+      cutHint,
       (res.line_count ?? 0) > session.config.preview_lines,
       session.config,
     ),
@@ -243,6 +251,8 @@ export function formatLimitsLine(limits: ServerLimits | null | undefined): strin
 export function formatProcLine(proc: ProcSnapshot | null | undefined): string[] {
   if (!proc) return []
   const parts: string[] = []
+  if (proc.cwd !== undefined) parts.push(`cwd=${proc.cwd}`)
+  if (proc.uptime_ms !== undefined) parts.push(`uptime=${fmtMs(proc.uptime_ms)}`)
   if (proc.rss_bytes !== undefined) parts.push(`rss=${fmtSize(proc.rss_bytes)}`)
   if (proc.peak_rss_bytes !== undefined) parts.push(`peak=${fmtSize(proc.peak_rss_bytes)}`)
   if (proc.cpu_total_ms !== undefined) parts.push(`cpu_total=${fmtMs(proc.cpu_total_ms)}`)

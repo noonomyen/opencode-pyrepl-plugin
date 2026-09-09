@@ -44,27 +44,49 @@ test("reset is single-step and wipes state", async () => {
 
 test("interrupt stops a python loop", async () => {
   const ctx = fakeCtx("tools-sess-loop")
-  const r: string = await t.pyrepl_exec.execute({ code: "i = 0\nwhile True:\n    i += 1", timeout_s: 1 }, ctx)
+  const r: string = await t.pyrepl_exec.execute(
+    { code: "i = 0\nwhile True:\n    i += 1", timeout_s: 1, on_timeout: "detach" }, ctx)
   expect(r).toMatch(/status: running \(task (t_\d+)\)/)
   const m = r.match(/task (t_\d+)/)
   expect(m).not.toBeNull()
   const ri: string = await t.pyrepl_interrupt.execute({ task_id: m![1] }, ctx)
   expect(ri).toContain("interrupted")
-  expect(ri).toContain("_TaskKill")
+  expect(ri).toContain("KeyboardInterrupt")
 }, 15000)
 
-test("read grep filters output", async () => {
+test("timeout interrupts by default, detaches on request", async () => {
+  const ctx = fakeCtx("tools-sess-ontimeout")
+  const r: string = await t.pyrepl_exec.execute({ code: "import time\ntime.sleep(30)", timeout_s: 1 }, ctx)
+  expect(r).toContain("KeyboardInterrupt")
+  expect(r).not.toContain("status: running")
+  const ctx2 = fakeCtx("tools-sess-ontimeout2")
+  const r2: string = await t.pyrepl_exec.execute(
+    { code: "import time\ntime.sleep(30)", timeout_s: 1, on_timeout: "detach" }, ctx2)
+  expect(r2).toMatch(/status: running \(task (t_\d+)\)/)
+  const m = r2.match(/task (t_\d+)/)
+  await t.pyrepl_interrupt.execute({ task_id: m![1] }, ctx2)
+}, 30000)
+
+test("read grep filters live output, drop note after finish", async () => {
   const ctx = fakeCtx("tools-sess-grep")
-  await t.pyrepl_exec.execute({ code: "for i in range(3):\n    print(f'row-{i}')" }, ctx)
+  const r: string = await t.pyrepl_exec.execute(
+    { code: "import time\nfor i in range(3):\n    print(f'row-{i}')\ntime.sleep(30)", timeout_s: 1, on_timeout: "detach" },
+    ctx,
+  )
+  expect(r).toContain("task t_1")
   const hit: string = await t.pyrepl_read.execute({ task_id: "t_1", grep: "row-[12]" }, ctx)
-  expect(hit).toContain("task t_1: done")
+  expect(hit).toContain("task t_1: running")
   expect(hit).toContain("row-1")
   expect(hit).toContain("row-2")
   expect(hit).not.toContain("row-0")
   const miss: string = await t.pyrepl_read.execute({ task_id: "t_1", grep: "zzz-no-match" }, ctx)
-  expect(miss).toContain("task t_1: done")
+  expect(miss).toContain("task t_1: running")
   expect(miss).not.toContain("row-")
-})
+  await t.pyrepl_interrupt.execute({ task_id: "t_1" }, ctx)
+  const done: string = await t.pyrepl_read.execute({ task_id: "t_1" }, ctx)
+  expect(done).toContain("task t_1: interrupted")
+  expect(done).toContain("dropped when the task finished")
+}, 30000)
 
 test("sessions are isolated with own fresh state", async () => {
   const r: string = await t.pyrepl_exec.execute({ code: "x" }, fakeCtx("tools-sess-2"))
@@ -125,34 +147,49 @@ test("big result retrievable via read target=result", async () => {
   expect(rd).toContain("2999]")
 })
 
-test("status: empty, session, one task, unknown task", async () => {
+test("status is a paramless health snapshot", async () => {
   const ctx = fakeCtx("tools-sess-status")
   expect(await t.pyrepl_status.execute({}, ctx)).toContain("no REPL session")
   await t.pyrepl_exec.execute({ code: "sv = 1" }, ctx)
   const st: string = await t.pyrepl_status.execute({}, ctx)
   expect(st).toContain("exec count 1")
-  expect(st).not.toContain("t_1")
-  const one: string = await t.pyrepl_status.execute({ task_id: "t_1" }, ctx)
-  expect(one).toContain("task t_1: done")
-  expect(await t.pyrepl_status.execute({ task_id: "t_nope" }, ctx)).toContain("unknown task")
+  expect(st).toContain("limits: mem=")
+  expect(st).toContain("rss=")
+  expect(st).toContain("cwd=")
+  expect(st).toContain("idle: no task running")
 })
 
-test("status history needs limit/filter params", async () => {
-  const ctx = fakeCtx("tools-sess-status2")
-  await t.pyrepl_exec.execute({ code: "v = 1" }, ctx)
-  const st: string = await t.pyrepl_status.execute({}, ctx)
-  expect(st).toContain("limits: mem=")
-  expect(st).toContain("proc: rss=")
-  expect(st).not.toContain("recent")
-  const hist: string = await t.pyrepl_status.execute({ limit: 5 }, ctx)
+test("tasks lists history, singles out one task, appends vars", async () => {
+  const ctx = fakeCtx("tools-sess-tasks")
+  await t.pyrepl_exec.execute({ code: "tv_watch = [1, 2]\ntv_watch" }, ctx)
+  const hist: string = await t.pyrepl_tasks.execute({ limit: 5 }, ctx)
   expect(hist).toContain("recent (last 1):")
   expect(hist).toContain("- t_1: done wall=")
-  expect(await t.pyrepl_status.execute({ filter: "failed" }, ctx)).toContain("no matching tasks")
+  expect(hist).toContain("vars (")
+  expect(hist).toContain("tv_watch: list")
+  const one: string = await t.pyrepl_tasks.execute({ task_id: "t_1" }, ctx)
+  expect(one).toContain("task t_1: done")
+  expect(await t.pyrepl_tasks.execute({ task_id: "t_nope" }, ctx)).toContain("unknown task")
+  expect(await t.pyrepl_tasks.execute({ filter: "failed" }, ctx)).toContain("no matching tasks")
+})
+
+test("vars lists and inspects", async () => {
+  const ctx = fakeCtx("tools-sess-vars")
+  await t.pyrepl_exec.execute({ code: "vv_big = list(range(10))\nvv_s = 3" }, ctx)
+  const li: string = await t.pyrepl_vars.execute({ pattern: "^vv_" }, ctx)
+  expect(li).toContain("vv_big: list")
+  expect(li).toContain("vv_s: int")
+  const big: string = await t.pyrepl_vars.execute({ sort: "size", limit: 3 }, ctx)
+  expect(big).toContain("vv_big")
+  const one: string = await t.pyrepl_vars.execute({ name: "vv_big" }, ctx)
+  expect(one).toContain("[0, 1, 2")
+  expect(one).toContain("9]")
+  expect(await t.pyrepl_vars.execute({ name: "vv_nope" }, ctx)).toContain("unknown variable")
 })
 
 test("reset while busy names the task", async () => {
   const ctx = fakeCtx("tools-sess-busyreject")
-  const execP = t.pyrepl_exec.execute({ code: "while True:\n    pass", timeout_s: 30 }, ctx)
+  const execP = t.pyrepl_exec.execute({ code: "while True:\n    pass", timeout_s: 30, on_timeout: "detach" }, ctx)
   execP.catch(() => {})
   const deadline = Date.now() + 15000
   for (;;) {
@@ -202,7 +239,8 @@ test("session.deleted respawns fresh", async () => {
 
 test("busy replies consume no id", async () => {
   const ctx = fakeCtx("tools-sess-unified")
-  const r: string = await t.pyrepl_exec.execute({ code: "while True:\n    pass", timeout_s: 1 }, ctx)
+  const r: string = await t.pyrepl_exec.execute(
+    { code: "while True:\n    pass", timeout_s: 1, on_timeout: "detach" }, ctx)
   const m = r.match(/task (t_\d+)/)
   expect(m?.[1]).toBe("t_1")
   expect(r).not.toContain("exec #")
@@ -227,7 +265,8 @@ test("every exec ends with a resource one-liner", async () => {
 
 test("preempt interrupts the running task and runs new code", async () => {
   const ctx = fakeCtx("tools-sess-preempt")
-  const r: string = await t.pyrepl_exec.execute({ code: "while True:\n    pass", timeout_s: 1 }, ctx)
+  const r: string = await t.pyrepl_exec.execute(
+    { code: "while True:\n    pass", timeout_s: 1, on_timeout: "detach" }, ctx)
   expect(r).toContain("task t_1")
   const r2: string = await t.pyrepl_exec.execute({ code: "40 + 2", preempt: true }, ctx)
   expect(r2).toContain("Out[2]: 42")
@@ -242,29 +281,83 @@ test("alloc goes negative when the task frees memory", async () => {
   expect(r).toMatch(/alloc=-\d+(\.\d+)?(B|KB|MB)/)
 })
 
-test("KeyboardInterrupt-swallowing loop still dies", async () => {
+test("KeyboardInterrupt-swallowing tight loop still dies (edge delivery)", async () => {
   const ctx = fakeCtx("tools-sess-killswallow")
   const r: string = await t.pyrepl_exec.execute(
-    { code: "i = 0\nwhile True:\n    try:\n        i += 1\n    except KeyboardInterrupt:\n        continue", timeout_s: 1 }, ctx)
+    { code: "i = 0\nwhile True:\n    try:\n        i += 1\n    except KeyboardInterrupt:\n        continue", timeout_s: 1, on_timeout: "detach" }, ctx)
   const m = r.match(/task (t_\d+)/)
   expect(m).not.toBeNull()
   const t0 = Date.now()
   const rk: string = await t.pyrepl_interrupt.execute({ task_id: m![1] }, ctx)
-  expect(rk).toContain("_TaskKill")
+  expect(rk).toContain("interrupted")
+  expect(rk).toContain("KeyboardInterrupt")
   expect(Date.now() - t0).toBeLessThan(8000)
 }, 25000)
 
-test("interrupt wait_s bounds native waits", async () => {
+test("interrupt wait_s bounds swallowing loops, kill ends them", async () => {
   const ctx = fakeCtx("tools-sess-waits")
-  const r: string = await t.pyrepl_exec.execute({ code: "import time\ntime.sleep(30)", timeout_s: 1 }, ctx)
+  const r: string = await t.pyrepl_exec.execute(
+    { code: "while True:\n    try:\n        while True:\n            x = 1\n    except BaseException:\n        continue", timeout_s: 1, on_timeout: "detach" }, ctx)
   const m = r.match(/task (t_\d+)/)
   expect(m).not.toBeNull()
   const t0 = Date.now()
   const rw: string = await t.pyrepl_interrupt.execute({ task_id: m![1], wait_s: 1 }, ctx)
   expect(rw).toContain("running")
   expect(Date.now() - t0).toBeLessThan(8000)
-  expect(rw).toContain("interrupt pending")
-}, 25000)
+  expect(rw).toContain("mode=kill")
+  const rk: string = await t.pyrepl_interrupt.execute({ task_id: m![1], mode: "kill" }, ctx)
+  expect(rk).toContain("killed")
+  const r2: string = await t.pyrepl_exec.execute({ code: "40 + 2" }, ctx)
+  expect(r2).toContain("Out[1]: 42")
+}, 30000)
+
+test("kill on a finished task does not wipe the session", async () => {
+  const ctx = fakeCtx("tools-sess-killfinished")
+  await t.pyrepl_exec.execute({ code: "kv_keep = 7" }, ctx)
+  const rk: string = await t.pyrepl_interrupt.execute({ task_id: "t_1", mode: "kill" }, ctx)
+  expect(rk).toContain("already finished")
+  // Session object untouched: state survives, no respawn note.
+  const r2: string = await t.pyrepl_exec.execute({ code: "kv_keep * 2" }, ctx)
+  expect(r2).toContain("Out[2]: 14")
+  expect(r2).not.toContain("<pyrepl>")
+}, 30000)
+
+test("init fails closed when the server stops responding", async () => {
+  const { sessions } = await import("../src/session.ts")
+  const ctx = fakeCtx("tools-sess-initwedged")
+  await t.pyrepl_exec.execute({ code: "1" }, ctx)
+  // Wedge the pipe, then pin the race window: the exit event may or may
+  // not have propagated, but the list RPC cannot be answered either way.
+  const sess = sessions.get("tools-sess-initwedged")
+  sess?.proc.kill("SIGKILL")
+  await sleep(500)
+  if (sess) sess.dead = false
+  const r: string = await t.pyrepl_init.execute({ bin_path: "/usr/bin/python3" }, ctx)
+  expect(r).toContain("not responding")
+  expect(r).not.toContain("REPL ready")
+  await (hooks as any).event({ event: { type: "session.deleted", properties: { info: { id: "tools-sess-initwedged" } } } })
+}, 30000)
+
+test("init with different bin refused while running", async () => {
+  const ctx = fakeCtx("tools-sess-initrefuse")
+  const execP = t.pyrepl_exec.execute(
+    { code: "while True:\n    pass", timeout_s: 30, on_timeout: "detach" }, ctx)
+  execP.catch(() => {})
+  const deadline = Date.now() + 15000
+  for (;;) {
+    const st: string = await t.pyrepl_status.execute({}, ctx)
+    if (st.includes("running: task t_1")) break
+    if (Date.now() >= deadline) throw new Error("task never reached running")
+    await sleep(200)
+  }
+  const refused: string = await t.pyrepl_init.execute({ bin_path: "/usr/bin/python3" }, ctx)
+  expect(refused).toContain("init refused")
+  expect(refused).toContain("t_1")
+  await t.pyrepl_interrupt.execute({ task_id: "t_1" }, ctx)
+  await execP
+  const ok: string = await t.pyrepl_init.execute({ bin_path: "/usr/bin/python3" }, ctx)
+  expect(ok).toMatch(/REPL (ready|already running)/)
+}, 60000)
 
 test("no mem warn on small tasks", async () => {
   const r: string = await t.pyrepl_exec.execute({ code: "1 + 1" }, fakeCtx("tools-sess-nowarn"))
@@ -282,13 +375,14 @@ test("NaN timeout_s falls back to default instead of throwing", async () => {
 test("NaN limit falls back to default history size", async () => {
   const ctx = fakeCtx("tools-sess-nanlimit")
   await t.pyrepl_exec.execute({ code: "9" }, ctx)
-  const st: string = await t.pyrepl_status.execute({ limit: NaN }, ctx)
+  const st: string = await t.pyrepl_tasks.execute({ limit: NaN }, ctx)
   expect(st).toContain("recent (last 1):")
 })
 
 test("interrupt wait_s: NaN clamps to default", async () => {
   const ctx = fakeCtx("tools-sess-nanwait")
-  const r: string = await t.pyrepl_exec.execute({ code: "while True:\n    pass", timeout_s: 1 }, ctx)
+  const r: string = await t.pyrepl_exec.execute(
+    { code: "while True:\n    pass", timeout_s: 1, on_timeout: "detach" }, ctx)
   const m = r.match(/task (t_\d+)/)
   expect(m).not.toBeNull()
   const ri: string = await t.pyrepl_interrupt.execute({ task_id: m![1], wait_s: NaN }, ctx)

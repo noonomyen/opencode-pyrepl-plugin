@@ -24,7 +24,9 @@ export function handleLine(session: Session, line: string) {
   } catch {
     return
   }
-  if (msg.id === undefined) return
+  // ids are numbers we minted; anything else (null from the server's
+  // bad-json reply, strings) can never match a pending call.
+  if (typeof msg.id !== "number") return
   const pend = session.pending.get(msg.id)
   if (pend) {
     session.pending.delete(msg.id)
@@ -222,6 +224,7 @@ export async function rpcAbortable(
 }
 
 export function killSession(session: Session) {
+  session.dead = true
   try {
     session.proc.kill("SIGKILL")
   } catch {

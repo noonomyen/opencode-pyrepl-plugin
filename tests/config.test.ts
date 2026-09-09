@@ -138,6 +138,33 @@ test("package version matches engine VERSION", () => {
   expect(m?.[1]).toBe(pkg.version)
 })
 
+test("on_timeout enum accepts known values, rejects the rest", async () => {
+  isolatedGlobal()
+  // Separate dirs per case: the file cache keys on mtime+size, so rapid
+  // same-dir rewrites of same-size content could read stale.
+  const okDir = mkdtempSync(path.join(tmpdir(), "pyrepl-cfg-enumok-"))
+  writeProjectConfig(okDir, `{"on_timeout": "detach"}`)
+  expect((await getConfig({ worktree: okDir, directory: okDir })).on_timeout).toBe("detach")
+  const caseDir = mkdtempSync(path.join(tmpdir(), "pyrepl-cfg-enumcase-"))
+  writeProjectConfig(caseDir, `{"on_timeout": "DETACH"}`)
+  const bad = await loadMergedConfig({ worktree: caseDir, directory: caseDir })
+  expect(bad.config.on_timeout).toBe("interrupt")
+  expect(bad.warnings.join("\n")).toMatch(/on_timeout/)
+  const numDir = mkdtempSync(path.join(tmpdir(), "pyrepl-cfg-enumnum-"))
+  writeProjectConfig(numDir, `{"on_timeout": 1}`)
+  expect((await getConfig({ worktree: numDir, directory: numDir })).on_timeout).toBe("interrupt")
+})
+
+test("on_timeout layers like other keys (project beats global)", async () => {
+  const g = isolatedGlobal()
+  writeFileSync(path.join(g, "pyrepl.jsonc"), `{"on_timeout": "detach"}`)
+  const plain = mkdtempSync(path.join(tmpdir(), "pyrepl-cfg-enuml-"))
+  expect((await getConfig({ worktree: plain, directory: plain })).on_timeout).toBe("detach")
+  const over = mkdtempSync(path.join(tmpdir(), "pyrepl-cfg-enumo-"))
+  writeProjectConfig(over, `{"on_timeout": "bogus"}`)
+  expect((await getConfig({ worktree: over, directory: over })).on_timeout).toBe("detach")
+})
+
 test("invalid JSONC is ignored with a warning, defaults survive", async () => {
   isolatedGlobal()
   const dir = mkdtempSync(path.join(tmpdir(), "pyrepl-cfg-invalid-"))

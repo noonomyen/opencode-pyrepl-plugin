@@ -26,6 +26,7 @@ export type ResolvedConfig = {
   notify_agent: boolean
   notify_poll_ms: number
   notify_progress_s: number
+  on_timeout: "interrupt" | "detach"
   max_lines: number
   max_bytes: number
   max_line_chars: number
@@ -51,6 +52,7 @@ export const DEFAULT_CONFIG: ResolvedConfig = {
   notify_agent: true,
   notify_poll_ms: 5000,
   notify_progress_s: 0,
+  on_timeout: "interrupt",
   max_lines: 5000,
   max_bytes: 1000000,
   max_line_chars: 10000,
@@ -69,6 +71,7 @@ type FieldSpec =
   | { kind: "int"; min: number }
   | { kind: "bool" }
   | { kind: "strOrNull" }
+  | { kind: "enum"; values: readonly string[] }
 
 const FIELDS: Record<keyof ResolvedConfig, FieldSpec> = {
   python: { kind: "strOrNull" },
@@ -81,6 +84,7 @@ const FIELDS: Record<keyof ResolvedConfig, FieldSpec> = {
   notify_agent: { kind: "bool" },
   notify_poll_ms: { kind: "int", min: 1 },
   notify_progress_s: { kind: "int", min: 0 },
+  on_timeout: { kind: "enum", values: ["interrupt", "detach"] },
   max_lines: { kind: "int", min: 1 },
   max_bytes: { kind: "int", min: 1 },
   max_line_chars: { kind: "int", min: 1 },
@@ -191,6 +195,12 @@ function applyFile(
       const r = coerceInt(raw, fallback as number, spec.min)
       ;(next as Record<string, unknown>)[key] = r.value
       if (r.bad) warnings.push(`bad value for ${key} in ${source}, keeping ${fallback}`)
+    } else if (spec.kind === "enum") {
+      if (typeof raw === "string" && (spec.values as readonly string[]).includes(raw)) {
+        ;(next as Record<string, unknown>)[key] = raw
+      } else {
+        warnings.push(`bad value for ${key} in ${source}, keeping ${fallback}`)
+      }
     } else {
       const r = coerceBool(raw, fallback as boolean)
       ;(next as Record<string, unknown>)[key] = r.value
@@ -373,7 +383,8 @@ export const CONFIG_TEMPLATE = `{
   "python": null,
 
   // TS-side knobs.
-  "timeout_s": 30,          // per-exec synchronous wait; the task keeps running after it
+  "timeout_s": 30,          // per-exec synchronous wait
+  "on_timeout": "interrupt",// "interrupt" (stop it, return partial output) or "detach" (keep running, return task_id)
   "wait_grace_ms": 15000,   // extra RPC grace on top of timeout_s
   "rpc_timeout_ms": 15000,  // read/status/interrupt round-trip budget
   "preview_lines": 100,     // line cap for medium outputs (char budget wins for big ones)

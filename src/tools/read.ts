@@ -17,7 +17,7 @@ import { GUIDE, type ToolDeps } from "./common.ts"
 export function createReadTool(_deps: ToolDeps) {
   return tool({
     description:
-      "Read buffered output of a REPL task. Use for tasks that timed out (status running) or outputs that were truncated. Supports line ranges, tail mode, stream selection and regex grep." +
+      "Read a RUNNING task's output (line ranges, tail mode, stream selection, regex grep) or a finished task's value (target=result) and orphan stream. Finished tasks keep no output lines: only live output pages." +
       GUIDE,
     args: {
       task_id: tool.schema.string().describe("Task id returned by pyrepl_exec."),
@@ -54,7 +54,7 @@ export function createReadTool(_deps: ToolDeps) {
       )
       if (res?.status === "not_found") return `unknown task ${args.task_id}`
       if (res?.status === "error") return `read error: ${res.message ?? "unknown"}`
-      if (isTerminalTaskStatus(res.status) && res.task_id) session.consumed.add(res.task_id)
+      if (isTerminalTaskStatus(res?.status) && res?.task_id) session.consumed.add(res.task_id)
       const out: string[] = [`task ${res.task_id}: ${res.status}`]
       out.push(...formatResultValue(res, "re-read with target=result for full"))
       out.push(...formatErrorLines(res, true))
@@ -67,6 +67,7 @@ export function createReadTool(_deps: ToolDeps) {
       )
       if (preview.length > 0) out.push(...preview)
       else if (res.status === "running") out.push("(no output yet)")
+      if (res.note) out.push(`[note: ${res.note}]`)
       out.push(...formatDropNotes(res, true))
       out.push(...formatOrphanHint(res, "re-read with"))
       out.push(...formatWarn(res))

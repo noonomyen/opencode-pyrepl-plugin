@@ -4,10 +4,12 @@ import type { NotifyClient } from "../types.ts"
 // plugin-level description field, so cross-tool rules ride on each tool.
 // Kept terse: tool outputs are read by the agent, not humans.
 export const GUIDE =
-  " Single-flight: never call exec/init/reset in parallel;" +
+  " Single-flight: never call exec/init in parallel with a reset exec;" +
   " a second exec returns busy (read or interrupt the running task, then retry, or exec with preempt=true);" +
-  " init with a different bin kills the running task." +
-  " Prefer define-once/call-many, print sparingly, set timeout_s per attempt, reset when switching problems."
+  " init with a different bin is refused while a task runs (interrupt first); same-bin init preserves state." +
+  " Prefer define-once/call-many, end code with a bare expression to see its value instead of printing," +
+  " print sparingly (finished tasks keep values, not output lines), set timeout_s per attempt," +
+  " reset when switching problems, check pyrepl_vars before trusting old names."
 
 export type ToolDeps = {
   client: NotifyClient | null

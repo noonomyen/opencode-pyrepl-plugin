@@ -10,23 +10,10 @@ import { GUIDE, type ToolDeps } from "./common.ts"
 export function createStatusTool(_deps: ToolDeps) {
   return tool({
     description:
-      "Show live REPL session state without executing code: interpreter, exec count, resource limits, process counters, running tasks. Task history needs limit or filter params, otherwise only live info is shown. Use to re-orient after compaction or when unsure what is running." +
+      "Check the Python runtime is healthy without executing code: where it runs from (interpreter, cwd), uptime, memory vs caps, CPU appetite, namespace size, and any running task. Task history lives in pyrepl_tasks; variable listing in pyrepl_vars. Use to re-orient after compaction." +
       GUIDE,
-    args: {
-      task_id: tool.schema
-        .string()
-        .optional()
-        .describe("Check one task only instead of the whole session."),
-      limit: tool.schema
-        .number()
-        .optional()
-        .describe("Show this many recent tasks (history). Omit for live info only."),
-      filter: tool.schema
-        .enum(["all", "running", "failed"])
-        .optional()
-        .describe("History filter: all, running only, or failed (error+interrupted). Implies limit=10 when limit is omitted."),
-    },
-    async execute(args, context: ToolContext) {
+    args: {},
+    async execute(_args, context: ToolContext) {
       context.metadata({ title: "pyrepl status" })
       const session = sessions.get(context.sessionID)
       if (!session || session.dead) {
@@ -39,38 +26,16 @@ export function createStatusTool(_deps: ToolDeps) {
       } catch {
         return `REPL on ${session.bin} (${session.version}) is not responding. Re-run pyrepl_init to respawn.`
       }
-      const tasks = list?.tasks ?? []
-      if (args.task_id) {
-        const found = tasks.find((t) => t.task_id === args.task_id)
-        if (!found) return `unknown task ${args.task_id}`
-        return formatTaskLine(found, false)
-      }
+      const proc = list?.proc
       const out = [
         `REPL on ${session.bin} (${session.version}), exec count ${session.execCount}` +
-          (list?.proc?.vars !== undefined ? `, vars=${list.proc.vars}` : ""),
+          (proc?.vars !== undefined ? `, vars=${proc.vars}` : ""),
         ...formatLimitsLine(list?.limits ?? session.limits),
-        ...formatProcLine(list?.proc),
+        ...formatProcLine(proc),
       ]
-      const running = tasks.filter((t) => t.task_status === "running")
+      const running = (list?.tasks ?? []).filter((t) => t.task_status === "running")
       for (const t of running) out.push(`running: ${formatTaskLine(t, false)}`)
-      // History is opt-in: without limit/filter the agent gets live
-      // info only, keeping bg-status checks cheap.
-      const wantHistory = args.limit !== undefined || args.filter !== undefined
-      if (!wantHistory) return out.join("\n")
-      const rawLimit = args.limit ?? 10
-      const n = Number.isFinite(rawLimit) ? Math.max(1, Math.floor(rawLimit)) : 10
-      let hist = tasks
-      if (args.filter === "running") hist = hist.filter((t) => t.task_status === "running")
-      else if (args.filter === "failed") {
-        hist = hist.filter((t) => t.task_status === "error" || t.task_status === "interrupted")
-      }
-      hist = hist.slice(-n)
-      if (hist.length === 0) {
-        out.push("no matching tasks")
-      } else {
-        out.push(`recent (last ${hist.length}):`)
-        for (const t of hist) out.push(formatTaskLine(t, true))
-      }
+      if (running.length === 0) out.push("idle: no task running")
       return out.join("\n")
     },
   })

@@ -28,7 +28,7 @@ test("long sleep finishes, readable after", async () => {
   const hooks: any = await loadPlugin()
   const ctx = fakeCtx("slow-sess-sleep")
   const r: string = await hooks.tool.pyrepl_exec.execute(
-    { code: "import time\ntime.sleep(5)\nprint('done-sleep')", timeout_s: 1 }, ctx)
+    { code: "import time\ntime.sleep(5)\nprint('done-sleep')", timeout_s: 1, on_timeout: "detach" }, ctx)
   const m = r.match(/task (t_\d+)/)
   expect(r).toContain("running")
   expect(m).not.toBeNull()
@@ -40,7 +40,8 @@ test("long sleep finishes, readable after", async () => {
     await sleep(500)
   }
   expect(rd).toContain(`task ${m![1]}: done`)
-  expect(rd).toContain("done-sleep")
+  // Lines are dropped at finish by design; totals prove it ran.
+  expect(rd).toContain("dropped when the task finished")
 }, 30000)
 
 test("agent notified on background completion, then notify-once", async () => {
@@ -50,7 +51,7 @@ test("agent notified on background completion, then notify-once", async () => {
   })
   const ctx = fakeCtx("slow-sess-notify")
   const r: string = await hooks.tool.pyrepl_exec.execute(
-    { code: "import time\ntime.sleep(3)\nprint('notify-marker-1')", timeout_s: 1 }, ctx)
+    { code: "import time\ntime.sleep(3)\nprint('notify-marker-1')", timeout_s: 1, on_timeout: "detach" }, ctx)
   const m = r.match(/task (t_\d+)/)
   expect(r).toContain("notify you")
   const t0 = Date.now()
@@ -80,11 +81,13 @@ test("read-first suppresses the wake-up", async () => {
   })
   const ctx = fakeCtx("slow-sess-readfirst")
   const r: string = await hooks.tool.pyrepl_exec.execute(
-    { code: "import time\ntime.sleep(2)\nprint('notify-marker-2')", timeout_s: 1 }, ctx)
+    { code: "import time\ntime.sleep(2)\nprint('notify-marker-2')", timeout_s: 1, on_timeout: "detach" }, ctx)
   const m = r.match(/task (t_\d+)/)
   await sleep(2600)
   const rd: string = await hooks.tool.pyrepl_read.execute({ task_id: m![1] }, ctx)
-  expect(rd).toContain("notify-marker-2")
+  // Lines are dropped at finish by design; the terminal read still marks
+  // the task consumed, which is what suppresses the wake-up.
+  expect(rd).toContain(`task ${m![1]}: done`)
   // Cover two waiter polls so a late wake-up cannot hide behind timing.
   await sleep(12000)
   expect(prompts.length).toBe(0)
@@ -107,7 +110,7 @@ test("failed prompt retries on session.idle", async () => {
   })
   const ctx = fakeCtx("slow-sess-idleflush")
   await hooks.tool.pyrepl_exec.execute(
-    { code: "import time\ntime.sleep(2)\nprint('notify-marker-3')", timeout_s: 1 }, ctx)
+    { code: "import time\ntime.sleep(2)\nprint('notify-marker-3')", timeout_s: 1, on_timeout: "detach" }, ctx)
   const t0 = Date.now()
   // The first prompt attempt only happens at a waiter poll (>=5s), by
   // which time the 2s task is terminal, so the idle flush below always
@@ -133,6 +136,7 @@ test("server death mid-task notifies, next exec respawns fresh", async () => {
     {
       code: "import threading, time, os\nthreading.Thread(target=lambda: (time.sleep(1.5), os._exit(1)), daemon=True).start()\nimport time as _t\n_t.sleep(30)",
       timeout_s: 1,
+      on_timeout: "detach",
     },
     ctx,
   )
@@ -154,7 +158,7 @@ test("progress_s sends interim notices, completion still fires", async () => {
   })
   const ctx = fakeCtx("slow-sess-progress")
   const r: string = await hooks.tool.pyrepl_exec.execute(
-    { code: "import time\ntime.sleep(7)\nprint('pg-done')", timeout_s: 1, progress_s: 2 }, ctx)
+    { code: "import time\ntime.sleep(7)\nprint('pg-done')", timeout_s: 1, on_timeout: "detach", progress_s: 2 }, ctx)
   const m = r.match(/task (t_\d+)/)
   const t0 = Date.now()
   while (prompts.length < 2 && Date.now() - t0 < 25000) await sleep(500)
